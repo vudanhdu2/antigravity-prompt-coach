@@ -6,6 +6,20 @@
 
 ---
 
+## Thông tin Phát hành & Lịch sử các Bản cập nhật (Changelog Công khai)
+
+| Phiên bản | Ngày giờ phát hành (GMT+7) | Mã Commit | Nội dung cập nhật chính |
+| :--- | :--- | :--- | :--- |
+| **`v1.0.1`** | `16/11/2026 12:47` | `main` | Bổ sung `CHANGELOG.md`, công khai lịch sử phiên bản kèm ngày giờ & chuẩn hóa 100% số liệu thực tế từ `0`. |
+| **`v1.0.0`** | `16/11/2026 12:26` | `0dfd9e6` | Phát hành bản độc lập Self-Host đầu tiên (`prompt_coach_server.py` + `web/` build sẵn, 0 phụ thuộc ngoài, `5/5` test PASS). |
+| **`v0.9.5`** | `16/11/2026 11:30` | `3e6346a` | Đồng bộ thứ tự phiên Realtime 1:1 với Antigravity PC (`Đã ghim` → `Đang chạy 4 chấm` → `Mới sửa gần nhất` mỗi 2.5s). |
+| **`v0.9.0`** | `16/11/2026 10:59` | `a401957` | Gói tối ưu P0 + P1 sau phản biện Swarm: sửa chấm oan phiên dài, kế thừa ngữ cảnh file, bóc tách `turn_duration_s` & `assistant_summary`, tăng tốc LRU cache. |
+| **`v0.8.0`** | `16/11/2026 09:20` | `89a7b69` | Ra mắt giao diện **Antigravity PC Song song (Thật ↔ 1-Phát)** Full Màn Hình (`100vw × 100dvh`) và **Bảng Chấm điểm Prompt**. |
+
+Xem chi tiết từng bản cập nhật tại [CHANGELOG.md](CHANGELOG.md).
+
+---
+
 ## Điểm nổi bật
 
 1. **Giao diện Antigravity PC Song song (Thật ↔ 1-Phát) Full Màn Hình (`100vw × 100dvh`)**:
