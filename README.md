@@ -1,22 +1,6 @@
 # Antigravity Prompt Coach v1.0 — Chấm Điểm 6×7 Rubric, Đối Chiếu Song Song Thật ↔ 1-Phát & Đồng Bộ Realtime PC (Self-Host · 100% Zero-Data-Leak)
 
-![Antigravity Prompt Coach v1.0](docs/cover.jpg)
-
 > **Bộ công cụ tự host (Self-Host) trên máy tính cá nhân giúp bạn tự động chấm điểm, bắt bệnh và tối ưu toàn bộ lịch sử Prompt của cả 3 công cụ AI: Antigravity Desktop, Claude Code và Codex Desktop (ChatGPT PC) — 0 cần cài Node.js hay thư viện ngoài (chỉ cần Python 3.9+ chuẩn), đồng bộ thứ tự Realtime 2.5 giây khớp 1:1 với cửa sổ Antigravity PC và giữ 100% dữ liệu trên ổ cứng máy bạn.**
-
----
-
-## Thông tin Phát hành & Lịch sử các Bản cập nhật (Changelog Công khai)
-
-| Phiên bản | Ngày giờ phát hành (GMT+7) | Mã Commit | Nội dung cập nhật chính |
-| :--- | :--- | :--- | :--- |
-| **`v1.0.1`** | `16/11/2026 12:47` | `main` | Bổ sung `CHANGELOG.md`, công khai lịch sử phiên bản kèm ngày giờ & chuẩn hóa 100% số liệu thực tế từ `0`. |
-| **`v1.0.0`** | `16/11/2026 12:26` | `0dfd9e6` | Phát hành bản độc lập Self-Host đầu tiên (`prompt_coach_server.py` + `web/` build sẵn, 0 phụ thuộc ngoài, `5/5` test PASS). |
-| **`v0.9.5`** | `16/11/2026 11:30` | `3e6346a` | Đồng bộ thứ tự phiên Realtime 1:1 với Antigravity PC (`Đã ghim` → `Đang chạy 4 chấm` → `Mới sửa gần nhất` mỗi 2.5s). |
-| **`v0.9.0`** | `16/11/2026 10:59` | `a401957` | Gói tối ưu P0 + P1 sau phản biện Swarm: sửa chấm oan phiên dài, kế thừa ngữ cảnh file, bóc tách `turn_duration_s` & `assistant_summary`, tăng tốc LRU cache. |
-| **`v0.8.0`** | `16/11/2026 09:20` | `89a7b69` | Ra mắt giao diện **Antigravity PC Song song (Thật ↔ 1-Phát)** Full Màn Hình (`100vw × 100dvh`) và **Bảng Chấm điểm Prompt**. |
-
-Xem chi tiết từng bản cập nhật tại [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

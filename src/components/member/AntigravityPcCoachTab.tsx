@@ -38,6 +38,10 @@ import {
     Zap,
 } from 'lucide-react';
 import { showToast } from '../common/ToastContainer';
+import {
+    RealtimeExecutiveReportPanel,
+    type RealtimeExecutiveReport,
+} from './RealtimeExecutiveReportPanel';
 
 export interface AgPcPromptCheck {
     key: string;
@@ -213,6 +217,7 @@ export interface AntigravityPcCoachTabProps {
     onToggleRealtimeAuto?: () => void;
     focusTurnIdx?: number | null;
     onClearFocusTurnIdx?: () => void;
+    realtimeReport?: RealtimeExecutiveReport | null;
 }
 
 const INITIAL_TURN_BATCH = 25;
@@ -689,8 +694,11 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
     onToggleRealtimeAuto,
     focusTurnIdx,
     onClearFocusTurnIdx,
+    realtimeReport,
 }) => {
     const [isFullscreen, setIsFullscreen] = useState<boolean>(true);
+    const [showRealtimeReport, setShowRealtimeReport] = useState<boolean>(false);
+    const [pendingScrollIdx, setPendingScrollIdx] = useState<number | null>(null);
     const [sidebarSortMode, setSidebarSortMode] = useState<'realtime' | 'priority'>('realtime');
     const [nowEpochSec, setNowEpochSec] = useState<number>(() => Math.floor(Date.now() / 1000));
     const [turnFilter, setTurnFilter] = useState<'all' | 'weak' | 'err' | 'redundant'>('all');
@@ -1296,6 +1304,25 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
         }
     }, [focusTurnIdx, detail, jumpToTurn, onClearFocusTurnIdx]);
 
+    useEffect(() => {
+        if (pendingScrollIdx && !showRealtimeReport && detail && detail.prompts_sample?.some(p => p.idx === pendingScrollIdx)) {
+            jumpToTurn(pendingScrollIdx);
+            setPendingScrollIdx(null);
+        }
+    }, [pendingScrollIdx, showRealtimeReport, detail, jumpToTurn]);
+
+    const handleOpenSessionTurnFromReport = useCallback(
+        (sessionKey: string, turnIdx?: number) => {
+            setShowRealtimeReport(false);
+            setMobileDrawerOpen(false);
+            onSelectSessionKey(sessionKey);
+            if (turnIdx && turnIdx > 0) {
+                setPendingScrollIdx(turnIdx);
+            }
+        },
+        [onSelectSessionKey]
+    );
+
     const problemTurnIdxs = useMemo(() => {
         const errList = visiblePrompts
             .filter(p => p.had_tool_error || Boolean(p.assistant_err_snippet))
@@ -1410,6 +1437,26 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                     >
                         <PanelLeft className="w-3.5 h-3.5" />
                     </button>
+
+                    {realtimeReport && (
+                        <button
+                            type="button"
+                            onClick={() => setShowRealtimeReport(v => !v)}
+                            title="Mở/Đóng Báo cáo Nhịp Realtime 30 Giây (Nắm bắt toàn cảnh không cần đọc từng câu prompt)"
+                            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border font-extrabold cursor-pointer whitespace-nowrap transition-colors tabular-nums ${
+                                showRealtimeReport
+                                    ? 'bg-amber-500 text-slate-950 border-amber-400 shadow-xs'
+                                    : 'bg-indigo-600/15 hover:bg-indigo-600/25 text-indigo-700 dark:text-indigo-200 border-indigo-500/40'
+                            }`}
+                        >
+                            <Zap className="w-3.5 h-3.5 text-amber-500 dark:text-amber-300 shrink-0" />
+                            <span>
+                                {showRealtimeReport
+                                    ? 'Đang xem Báo cáo 30s (Bấm về Hội thoại)'
+                                    : `Báo cáo Nhịp 30s · 1-Phát ${realtimeReport.kpis.one_shot_rate_pct}%`}
+                            </span>
+                        </button>
+                    )}
 
                     {detail && (
                         <div className="flex items-center gap-1.5 min-w-0 tabular-nums">
@@ -1648,9 +1695,32 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
 
                     {/* Quick Actions */}
                     <div className="px-3 pb-2 space-y-1">
+                        {realtimeReport && (
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    setShowRealtimeReport(v => !v);
+                                    setMobileDrawerOpen(false);
+                                }}
+                                className={`w-full px-3 py-1.5 rounded-lg border text-xs font-extrabold flex items-center justify-between gap-2 cursor-pointer transition-colors tabular-nums ${
+                                    showRealtimeReport
+                                        ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                                        : 'bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 border-indigo-500/35'
+                                }`}
+                            >
+                                <span className="inline-flex items-center gap-1.5">
+                                    <Zap className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                                    <span>Báo cáo Nhịp Realtime 30s</span>
+                                </span>
+                                <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-700 dark:text-emerald-200 font-black">
+                                    {realtimeReport.kpis.one_shot_rate_pct}%
+                                </span>
+                            </button>
+                        )}
                         <button
                             type="button"
                             onClick={() => {
+                                setShowRealtimeReport(false);
                                 setMobileDrawerOpen(false);
                                 composerRef.current?.focus();
                             }}
@@ -1730,6 +1800,7 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                                             key={`pin-${s.session_key}`}
                                             type="button"
                                             onClick={() => {
+                                                setShowRealtimeReport(false);
                                                 onSelectSessionKey(s.session_key);
                                                 setMobileDrawerOpen(false);
                                             }}
@@ -1885,7 +1956,22 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                 <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
                     {/* Scrollable Split Conversation Canvas */}
                     <div ref={canvasScrollRef} className="flex-1 overflow-y-auto px-3.5 sm:px-5 pb-5 space-y-3.5">
-                        {detailLoading && !detail ? (
+                        {showRealtimeReport && realtimeReport ? (
+                            <div className={`${isFullscreen ? 'max-w-[1680px]' : 'max-w-[1240px]'} mx-auto pt-3 space-y-3.5`}>
+                                <RealtimeExecutiveReportPanel
+                                    report={realtimeReport}
+                                    dark={agDark}
+                                    copiedId={copiedId}
+                                    onCopy={onCopy}
+                                    onOpenSessionTurn={handleOpenSessionTurnFromReport}
+                                    onLoadTemplateToComposer={tpl => {
+                                        setShowRealtimeReport(false);
+                                        loadIntoComposer(tpl, 'Đã nạp mẫu 1-Phát vào ô Composer!');
+                                    }}
+                                    onCloseReportView={() => setShowRealtimeReport(false)}
+                                />
+                            </div>
+                        ) : detailLoading && !detail ? (
                             <div className="py-16 text-center space-y-2 text-xs">
                                 <RefreshCw className="w-6 h-6 animate-spin text-indigo-500 mx-auto" />
                                 <div className="font-bold">Đang mở luồng Antigravity PC của phiên...</div>
@@ -1900,6 +1986,32 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                             </div>
                         ) : (
                             <div className={`${isFullscreen ? 'max-w-[1680px]' : 'max-w-[1240px]'} mx-auto pt-3 space-y-3.5`}>
+                                {/* Global 30-Second Realtime Pulse Strip — 1-click access to Executive Report */}
+                                {realtimeReport && (
+                                    <div
+                                        className={`rounded-xl border px-3.5 py-2 flex flex-wrap items-center justify-between gap-2 text-xs ${
+                                            agDark
+                                                ? 'bg-indigo-950/35 border-indigo-500/40 text-indigo-100'
+                                                : 'bg-indigo-50/90 border-indigo-200 text-slate-900'
+                                        }`}
+                                    >
+                                        <span className="inline-flex items-center gap-2 font-bold min-w-0">
+                                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-600 text-white font-extrabold shrink-0">
+                                                <Zap className="w-3 h-3 text-amber-300" />
+                                                <span>Nhịp 30s</span>
+                                            </span>
+                                            <span className="truncate">{realtimeReport.headline}</span>
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowRealtimeReport(true)}
+                                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold cursor-pointer shrink-0"
+                                        >
+                                            <span>Mở Báo cáo Nhịp Realtime 30s →</span>
+                                        </button>
+                                    </div>
+                                )}
+
                                 {/* Focus Habit Banner (inside scroll region so it never steals fixed viewport height) */}
                                 {focusHabit && (
                                     <div

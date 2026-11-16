@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict, deque
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 VN_TZ = dt.timezone(dt.timedelta(hours=7))
 AI_SCHEMA_VERSION = 3
@@ -3195,6 +3195,454 @@ def _get_or_eval_session_prompts(
     )
 
 
+_DIMENSION_META: list[tuple[str, str, str]] = [
+    ('goal', 'MT', 'Mục tiêu rõ'),
+    ('context', 'NC', 'Ngữ cảnh / File'),
+    ('boundaries', 'RG', 'Ranh giới không sửa'),
+    ('constraints', 'RB', 'Ràng buộc kỹ thuật'),
+    ('output_format', 'ĐR', 'Định dạng đầu ra'),
+    ('verification', 'KC', 'Tiêu chí Done'),
+    ('safety', 'AT', 'An toàn DB/Deploy'),
+]
+
+
+def _fast_turn_ts(ts_iso: str, sess_start_ts: float, sess_last_ts: float, idx: int, total_p: int) -> float:
+    raw = (ts_iso or '').strip()
+    if raw:
+        try:
+            norm = raw[:-1] + '+00:00' if raw.endswith('Z') else raw
+            return float(dt.datetime.fromisoformat(norm).timestamp())
+        except Exception:
+            pass
+    base_end = max(sess_last_ts, sess_start_ts)
+    if base_end <= 0:
+        return 0.0
+    if sess_start_ts > 0 and sess_last_ts > sess_start_ts and total_p > 1:
+        ratio = max(0.0, min(1.0, float(idx - 1) / float(max(1, total_p - 1))))
+        return sess_start_ts + (sess_last_ts - sess_start_ts) * ratio
+    return base_end - max(0, total_p - idx) * 30.0
+
+
+def _build_realtime_executive_report(
+    seen_sessions: Mapping[str, dict[str, Any]],
+    session_prompt_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+    totals: dict[str, Any],
+    settings: dict[str, Any],
+    period_label: str,
+    now_epoch: float,
+) -> dict[str, Any]:
+    """Tổng hợp Báo cáo Nhịp Realtime 30 Giây (Executive Pulse) giúp nắm bắt toàn cảnh mà không cần đọc từng prompt."""
+    max_p = int(settings.get('max_prompts_per_session') or 12)
+    max_h = float(settings.get('max_hours_per_session') or 2.0)
+    cutoff_2h = now_epoch - 7200.0
+
+    # 1. Live Pulse (Các phiên đang chạy + nhịp 2 giờ gần nhất)
+    running_list: list[dict[str, Any]] = []
+    recent_2h_sess_cnt = 0
+    for s in seen_sessions.values():
+        act_ts = float(s.get('last_activity_ts') or s.get('end_ts') or 0.0)
+        if act_ts >= cutoff_2h:
+            recent_2h_sess_cnt += 1
+        if s.get('is_running'):
+            sp = int(s.get('n_human_prompts') or 0)
+            sh = float(s.get('clean_active_hours') or 0.0)
+            needs_ho = sp > max_p or sh >= max_h
+            running_list.append({
+                'session_key': s['session_key'],
+                'title': s.get('title') or s.get('first_human_preview') or s['session_key'],
+                'project': s.get('project') or 'Chưa gắn dự án',
+                'tool': s.get('tool') or 'antigravity',
+                'n_human_prompts': sp,
+                'clean_active_hours': round(sh, 2),
+                'avg_prompt_score': float(s.get('avg_prompt_score') or 100.0),
+                'tool_error_count': int(s.get('tool_error_count') or 0),
+                'last_activity_ts': act_ts,
+                'needs_handoff': needs_ho,
+                'status_badge': 'Cần chốt HANDOFF' if needs_ho else 'Đang chạy ổn định',
+            })
+    running_list.sort(key=lambda x: (-float(x.get('last_activity_ts') or 0.0), -int(x.get('n_human_prompts') or 0)))
+
+    # 2. Quét toàn bộ các lượt prompt đã chấm trong kỳ
+    eval_cnt = len(session_prompt_pairs)
+    one_shot_cnt = 0
+    weak_cnt = 0
+    rework_cnt = 0
+    recent_2h_prompts = 0
+    recent_2h_score_sum = 0.0
+    recent_2h_terr = 0
+
+    dim_sums: dict[str, float] = {k: 0.0 for k, _, _ in _DIMENSION_META}
+    dim_fail_cnts: dict[str, int] = {k: 0 for k, _, _ in _DIMENSION_META}
+
+    # Bộ đếm 4 nhóm điểm nghẽn Pareto 80/20
+    bn_missing_done = 0
+    bn_missing_done_sample: tuple[dict[str, Any], dict[str, Any]] | None = None
+    bn_drip_nudge = 0
+    bn_drip_nudge_sample: tuple[dict[str, Any], dict[str, Any]] | None = None
+    bn_tool_vague = 0
+    bn_tool_vague_sample: tuple[dict[str, Any], dict[str, Any]] | None = None
+
+    recent_turns_candidates: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+    worst_prompt_per_sess: dict[str, dict[str, Any]] = {}
+    one_shot_per_project: dict[str, int] = {}
+
+    for s_item, ep in session_prompt_pairs:
+        skey = s_item['session_key']
+        proj_name = (s_item.get('project') or 'Chưa gắn dự án').strip() or 'Chưa gắn dự án'
+        sc = int(ep.get('score') or 70)
+        had_terr = bool(ep.get('had_tool_error'))
+        is_nudge = bool(ep.get('is_short_nudge'))
+        is_vague = bool(ep.get('is_vague_error'))
+        is_corr = bool(ep.get('is_corr_kw'))
+        mw = ep.get('merge_with') or []
+
+        is_1shot = (sc >= 78) and (not had_terr) and (not is_nudge) and (not is_vague) and (not mw)
+        if is_1shot:
+            one_shot_cnt += 1
+            one_shot_per_project[proj_name] = one_shot_per_project.get(proj_name, 0) + 1
+        if sc < 68:
+            weak_cnt += 1
+        if is_nudge or is_vague or is_corr or had_terr or bool(mw):
+            rework_cnt += 1
+
+        prev_worst = worst_prompt_per_sess.get(skey)
+        if prev_worst is None or sc < int(prev_worst.get('score') or 100):
+            worst_prompt_per_sess[skey] = ep
+
+        # Điểm 7 chiều Rubric
+        d_scores = ep.get('dimension_scores') or {}
+        for dk, _, _ in _DIMENSION_META:
+            dv = float(d_scores.get(dk, 75.0))
+            dim_sums[dk] += dv
+            if dv < 50.0:
+                dim_fail_cnts[dk] += 1
+
+        # Phân loại Pareto Bottlenecks
+        if is_nudge or bool(mw):
+            bn_drip_nudge += 1
+            if bn_drip_nudge_sample is None or sc < int(bn_drip_nudge_sample[1].get('score') or 100):
+                bn_drip_nudge_sample = (s_item, ep)
+        if had_terr or is_vague or is_corr:
+            bn_tool_vague += 1
+            if bn_tool_vague_sample is None or (had_terr and not bn_tool_vague_sample[1].get('had_tool_error')):
+                bn_tool_vague_sample = (s_item, ep)
+        if sc < 75 and (d_scores.get('verification', 100) < 50 or d_scores.get('context', 100) < 50):
+            bn_missing_done += 1
+            if bn_missing_done_sample is None or sc < int(bn_missing_done_sample[1].get('score') or 100):
+                bn_missing_done_sample = (s_item, ep)
+
+        turn_ts = _fast_turn_ts(
+            str(ep.get('ts_iso') or ''),
+            float(s_item.get('start_ts') or 0.0),
+            float(s_item.get('last_activity_ts') or s_item.get('end_ts') or 0.0),
+            int(ep.get('idx') or 1),
+            int(s_item.get('n_human_prompts') or 1),
+        )
+        if turn_ts >= cutoff_2h:
+            recent_2h_prompts += 1
+            recent_2h_score_sum += sc
+            if had_terr:
+                recent_2h_terr += 1
+        recent_turns_candidates.append((turn_ts, s_item, ep))
+
+    # Điểm nghẽn #3: Phiên kéo dài quá ngưỡng không HANDOFF
+    bloated_sessions = [
+        s for s in seen_sessions.values()
+        if int(s.get('n_human_prompts') or 0) > max_p or float(s.get('clean_active_hours') or 0.0) >= max_h
+    ]
+    bloated_sessions.sort(key=lambda x: (-int(x.get('n_human_prompts') or 0), -int(x.get('tool_error_count') or 0)))
+    excess_bloat_prompts = sum(max(1, int(s.get('n_human_prompts') or 0) - max_p) for s in bloated_sessions)
+
+    est_savable_prompts = min(
+        max(0, eval_cnt - max(1, len(seen_sessions))),
+        int(bn_drip_nudge + round(bn_tool_vague * 0.65) + round(excess_bloat_prompts * 0.35)),
+    )
+    est_savable_hours = round(est_savable_prompts * 2.5 / 60.0, 1)
+
+    dimension_avgs: list[dict[str, Any]] = []
+    for dk, dcode, dlabel in _DIMENSION_META:
+        avg_v = round(dim_sums[dk] / max(1, eval_cnt), 1) if eval_cnt > 0 else 85.0
+        status = 'good' if avg_v >= 78.0 else ('warn' if avg_v >= 60.0 else 'weak')
+        dimension_avgs.append({
+            'key': dk,
+            'code': dcode,
+            'label': dlabel,
+            'avg_score': avg_v,
+            'fail_count': dim_fail_cnts[dk],
+            'status': status,
+        })
+    weakest_dims = sorted(dimension_avgs, key=lambda d: (d['avg_score'], -d['fail_count']))[:2]
+
+    # 3. Top Điểm nghẽn Pareto 80/20
+    bottleneck_raw: list[dict[str, Any]] = [
+        {
+            'code': 'MISSING_DONE_SPEC',
+            'title': 'Giao việc thiếu Tiêu chí Nghiệm thu (Done) & File đích',
+            'severity': 'red' if bn_missing_done >= 5 else 'amber',
+            'impact_prompts': bn_missing_done,
+            'impact_pct': round(bn_missing_done * 100.0 / max(1, eval_cnt), 1),
+            'why': f'{bn_missing_done}/{max(1, eval_cnt)} câu chưa khóa rõ File hoặc lệnh Test/Verify cuối câu nên AI phải tự đoán hoặc hỏi lại.',
+            'fix_rule': 'Chốt 1 dòng cuối câu: "Tại [File], giữ nguyên logic cũ. Done khi chạy pass [lệnh test/UI]".',
+            'quick_template': 'Tại file [đường_dẫn_file], thực hiện [mục_tiêu_cụ_thể]. Giữ nguyên các phần không liên quan. Done: kiểm tra `npx tsc --noEmit` và verify kết quả thật trước khi báo.',
+            'sample_session_key': bn_missing_done_sample[0]['session_key'] if bn_missing_done_sample else '',
+            'sample_session_title': (bn_missing_done_sample[0].get('title') or bn_missing_done_sample[0]['session_key']) if bn_missing_done_sample else '',
+            'sample_idx': int(bn_missing_done_sample[1].get('idx') or 1) if bn_missing_done_sample else 1,
+        },
+        {
+            'code': 'DRIP_AND_NUDGE',
+            'title': 'Chia lẻ yêu cầu nhỏ giọt & câu nhắc ngắn ("tiếp", "cả...", "thêm...")',
+            'severity': 'amber',
+            'impact_prompts': bn_drip_nudge,
+            'impact_pct': round(bn_drip_nudge * 100.0 / max(1, eval_cnt), 1),
+            'why': f'{bn_drip_nudge} lượt nhắc ngắn hoặc bổ sung lắt nhắt có thể gộp thẳng vào câu mở đầu để tiết kiệm vòng chờ.',
+            'fix_rule': 'Gom các ý phụ vào danh sách đánh số (1)-(2)-(3) ngay từ lượt đầu và dặn AI tự chạy trọn quy trình.',
+            'quick_template': 'Thực hiện trọn gói trong 1 lượt không dừng giữa chừng: (1) [Việc chính], (2) [Yêu cầu giao diện/phụ], (3) Tự chạy kiểm thử và deploy/verify hoàn tất.',
+            'sample_session_key': bn_drip_nudge_sample[0]['session_key'] if bn_drip_nudge_sample else '',
+            'sample_session_title': (bn_drip_nudge_sample[0].get('title') or bn_drip_nudge_sample[0]['session_key']) if bn_drip_nudge_sample else '',
+            'sample_idx': int(bn_drip_nudge_sample[1].get('idx') or 1) if bn_drip_nudge_sample else 1,
+        },
+        {
+            'code': 'SESSION_BLOAT_NO_HANDOFF',
+            'title': f'Neo phiên quá dài (>{max_p} câu hoặc >{max_h:g}h) chưa cắt HANDOFF',
+            'severity': 'red' if len(bloated_sessions) >= 2 else 'amber',
+            'impact_prompts': excess_bloat_prompts,
+            'impact_pct': round(excess_bloat_prompts * 100.0 / max(1, max(eval_cnt, int(totals.get('direct_prompts') or 1))), 1),
+            'why': f'{len(bloated_sessions)} phiên vượt ngưỡng khuyến nghị ({excess_bloat_prompts} lượt vượt ngưỡng), làm ngữ cảnh phình to và tăng lỗi Tool.',
+            'fix_rule': f'Cứ chạm mốc {max_p} câu hoặc xong 1 tính năng, yêu cầu AI xuất HANDOFF 8 dòng để sang phiên mới.',
+            'quick_template': 'Chốt chặng này: hãy tóm tắt vào khối HANDOFF 8 dòng gồm (1) Các file đã sửa & commit, (2) Trạng thái hiện tại, (3) Việc cần làm tiếp theo để tôi mở phiên mới sạch ngữ cảnh.',
+            'sample_session_key': bloated_sessions[0]['session_key'] if bloated_sessions else '',
+            'sample_session_title': (bloated_sessions[0].get('title') or bloated_sessions[0]['session_key']) if bloated_sessions else '',
+            'sample_idx': 1,
+        },
+        {
+            'code': 'TOOL_AND_VAGUE_ERROR',
+            'title': 'Báo lỗi thiếu Log/File hoặc câu lệnh gây vấp lỗi Tool',
+            'severity': 'red' if bn_tool_vague >= 5 else 'amber',
+            'impact_prompts': bn_tool_vague,
+            'impact_pct': round(bn_tool_vague * 100.0 / max(1, eval_cnt), 1),
+            'why': f'{bn_tool_vague} lượt phát sinh lỗi Tool hoặc phải sửa lại vì báo lỗi ngắn chưa kèm mã lỗi / dòng file.',
+            'fix_rule': 'Khi báo lỗi, dán kèm [Đường dẫn file / URL] + [Thông báo lỗi / Ảnh chụp] + [Hành vi đúng].',
+            'quick_template': 'Tại [file/route] đang gặp lỗi: "[dán_log_hoặc_hiện_tượng]". Hãy đọc nguyên nhân gốc, sửa dứt điểm trong phạm vi [file], bảo toàn dữ liệu hiện có và kiểm tra lại.',
+            'sample_session_key': bn_tool_vague_sample[0]['session_key'] if bn_tool_vague_sample else '',
+            'sample_session_title': (bn_tool_vague_sample[0].get('title') or bn_tool_vague_sample[0]['session_key']) if bn_tool_vague_sample else '',
+            'sample_idx': int(bn_tool_vague_sample[1].get('idx') or 1) if bn_tool_vague_sample else 1,
+        },
+    ]
+    top_bottlenecks = [b for b in sorted(bottleneck_raw, key=lambda x: -int(x['impact_prompts'])) if int(b['impact_prompts']) > 0][:4]
+    if not top_bottlenecks:
+        top_bottlenecks = bottleneck_raw[:2]
+
+    # 4. Ma trận Sức khỏe theo Dự án (by_project)
+    proj_map: dict[str, dict[str, Any]] = {}
+    for s in seen_sessions.values():
+        pname = (s.get('project') or 'Chưa gắn dự án').strip() or 'Chưa gắn dự án'
+        pe = proj_map.setdefault(pname, {
+            'project': pname,
+            'sessions_count': 0,
+            'running_count': 0,
+            'prompts_count': 0,
+            'score_weighted_sum': 0.0,
+            'weak_prompts_count': 0,
+            'mergeable_count': 0,
+            'tool_error_count': 0,
+            'hottest_session_key': '',
+            'hottest_session_title': '',
+            '_hottest_weight': -1.0,
+        })
+        sp = max(1, int(s.get('period_human_prompts') or s.get('n_human_prompts') or 1))
+        sc_avg = float(s.get('avg_prompt_score') or s.get('rule_score') or 80.0)
+        terrs = int(s.get('tool_error_count') or 0)
+        weaks = int(s.get('weak_prompt_count') or 0)
+        merges = int(s.get('mergeable_count') or 0)
+
+        pe['sessions_count'] += 1
+        if s.get('is_running'):
+            pe['running_count'] += 1
+        pe['prompts_count'] += sp
+        pe['score_weighted_sum'] += sc_avg * sp
+        pe['weak_prompts_count'] += weaks
+        pe['mergeable_count'] += merges
+        pe['tool_error_count'] += terrs
+
+        hot_w = (500.0 if s.get('is_running') else 0.0) + terrs * 10.0 + weaks * 5.0 + sp * 2.0
+        if hot_w > pe['_hottest_weight']:
+            pe['_hottest_weight'] = hot_w
+            pe['hottest_session_key'] = s['session_key']
+            pe['hottest_session_title'] = s.get('title') or s.get('first_human_preview') or s['session_key']
+
+    by_project: list[dict[str, Any]] = []
+    for pname, pe in proj_map.items():
+        p_cnt = max(1, int(pe['prompts_count']))
+        p_1shot = int(one_shot_per_project.get(pname, 0))
+        by_project.append({
+            'project': pname,
+            'sessions_count': pe['sessions_count'],
+            'running_count': pe['running_count'],
+            'prompts_count': pe['prompts_count'],
+            'avg_prompt_score': round(pe['score_weighted_sum'] / p_cnt, 1),
+            'one_shot_pct': round(min(100.0, p_1shot * 100.0 / p_cnt), 1),
+            'weak_prompts_count': pe['weak_prompts_count'],
+            'tool_error_count': pe['tool_error_count'],
+            'savable_prompts': int(pe['mergeable_count'] + round(pe['weak_prompts_count'] * 0.45)),
+            'hottest_session_key': pe['hottest_session_key'],
+            'hottest_session_title': pe['hottest_session_title'],
+        })
+    by_project.sort(key=lambda x: (-int(x['running_count']), -int(x['prompts_count']), -int(x['tool_error_count'])))
+
+    # 5. Top 5 Ca Nóng Cần Xem Ngay (Actionable Cases — chỉ cần xem đúng 5 ca này thay vì đọc cả trăm phiên)
+    actionable_scored: list[tuple[float, dict[str, Any]]] = []
+    for s in seen_sessions.values():
+        sp = int(s.get('n_human_prompts') or 0)
+        sh = float(s.get('clean_active_hours') or 0.0)
+        terrs = int(s.get('tool_error_count') or 0)
+        redirs = int(s.get('redirection_count') or 0)
+        weaks = int(s.get('weak_prompt_count') or 0)
+        merges = int(s.get('mergeable_count') or 0)
+        avg_sc = float(s.get('avg_prompt_score') or 100.0)
+        is_run = bool(s.get('is_running'))
+
+        prio = (
+            (320.0 if (is_run and (sp > max_p or terrs > 0 or weaks > 0)) else (140.0 if is_run else 0.0))
+            + terrs * 9.0
+            + redirs * 14.0
+            + merges * 11.0
+            + weaks * 4.5
+            + max(0, sp - max_p) * 5.0
+            + max(0.0, 85.0 - avg_sc) * 1.5
+        )
+        if prio <= 5.0 and len(seen_sessions) > 5:
+            continue
+        actionable_scored.append((prio, s))
+
+    actionable_scored.sort(key=lambda x: (-x[0], -float(x[1].get('last_activity_ts') or 0.0)))
+    top_actionable_cases: list[dict[str, Any]] = []
+    for _, s in actionable_scored[:5]:
+        skey = s['session_key']
+        sp = int(s.get('n_human_prompts') or 0)
+        sh = float(s.get('clean_active_hours') or 0.0)
+        terrs = int(s.get('tool_error_count') or 0)
+        weaks = int(s.get('weak_prompt_count') or 0)
+        merges = int(s.get('mergeable_count') or 0)
+        is_run = bool(s.get('is_running'))
+        worst_ep = worst_prompt_per_sess.get(skey) or {}
+
+        reasons: list[str] = []
+        if is_run:
+            reasons.append('Đang chạy Live')
+        if sp > max_p or sh >= max_h:
+            reasons.append(f'Vượt ngưỡng ({sp}p / {sh:.1f}h)')
+        if terrs > 0:
+            reasons.append(f'{terrs} lỗi Tool')
+        if merges > 0:
+            reasons.append(f'Gộp được {merges} lượt')
+        elif weaks > 0:
+            reasons.append(f'{weaks} câu thiếu Spec')
+        if not reasons:
+            reasons.append(f'{sp} lượt · {float(s.get("avg_prompt_score") or 80.0):.0f}đ')
+
+        diag_1line = (
+            str(s.get('ai_summary') or '').strip()
+            or str(s.get('top_prompt_lesson') or '').strip()
+            or str(worst_ep.get('lesson') or '').strip()
+            or 'Nên gộp các yêu cầu nhỏ giọt và khóa Tiêu chí Done ngay câu mở đầu.'
+        )
+        consol_1shot = (
+            str(s.get('consolidated_prompt') or '').strip()
+            or str(worst_ep.get('improved_prompt') or '').strip()
+            or ''
+        )
+        savable_turns = max(1, merges + int(round(weaks * 0.4)) + max(0, sp - max_p) // 2) if (merges or weaks or sp > max_p) else 0
+        top_actionable_cases.append({
+            'session_key': skey,
+            'title': s.get('title') or s.get('first_human_preview') or skey,
+            'project': s.get('project') or 'Chưa gắn dự án',
+            'tool': s.get('tool') or 'antigravity',
+            'is_running': is_run,
+            'last_activity_ts': float(s.get('last_activity_ts') or s.get('end_ts') or 0.0),
+            'n_human_prompts': sp,
+            'clean_active_hours': round(sh, 2),
+            'avg_prompt_score': float(s.get('avg_prompt_score') or 80.0),
+            'tool_error_count': terrs,
+            'weak_prompt_count': weaks,
+            'mergeable_count': merges,
+            'savable_turns': min(max(0, sp - 1), savable_turns),
+            'reason_badge': ' · '.join(reasons[:3]),
+            'diagnosis_1line': _trunc_only(diag_1line, 220),
+            'consolidated_1shot': _trunc_only(consol_1shot, 520),
+            'worst_idx': int(worst_ep.get('idx') or 1),
+            'worst_prompt_text': _trunc_only(str(worst_ep.get('text_redacted') or s.get('first_human_preview') or ''), 180),
+        })
+
+    # 6. Dòng chảy 15 Lượt Prompt Vừa Gửi (Live Ticker)
+    recent_turns_candidates.sort(key=lambda x: (-x[0], -int(x[2].get('idx') or 0)))
+    live_recent_turns: list[dict[str, Any]] = []
+    for turn_ts, s_item, ep in recent_turns_candidates[:15]:
+        sc = int(ep.get('score') or 70)
+        had_terr = bool(ep.get('had_tool_error'))
+        live_recent_turns.append({
+            'session_key': s_item['session_key'],
+            'session_title': s_item.get('title') or s_item.get('first_human_preview') or s_item['session_key'],
+            'project': s_item.get('project') or 'Chưa gắn dự án',
+            'tool': s_item.get('tool') or 'antigravity',
+            'is_session_running': bool(s_item.get('is_running')),
+            'idx': int(ep.get('idx') or 1),
+            'ts_iso': str(ep.get('ts_iso') or ''),
+            'ts_epoch': round(turn_ts, 1),
+            'score': sc,
+            'level': str(ep.get('level') or _prompt_level(sc)),
+            'stage_label': str(ep.get('stage_label') or ''),
+            'verdict': str(ep.get('verdict') or ''),
+            'text_redacted': _trunc_only(str(ep.get('text_redacted') or ''), 220),
+            'improved_prompt': _trunc_only(str(ep.get('improved_prompt') or ''), 280),
+            'turn_duration_s': ep.get('turn_duration_s'),
+            'assistant_summary': _trunc_only(str(ep.get('assistant_summary') or ''), 160),
+            'had_tool_error': had_terr,
+            'failed_tools': (ep.get('failed_tools') or [])[:2],
+            'is_one_shot': (sc >= 78) and not had_terr,
+        })
+
+    one_shot_rate_pct = round(one_shot_cnt * 100.0 / max(1, eval_cnt), 1) if eval_cnt > 0 else 0.0
+    rework_rate_pct = round(rework_cnt * 100.0 / max(1, eval_cnt), 1) if eval_cnt > 0 else 0.0
+    recent_2h_avg_score = round(recent_2h_score_sum / max(1, recent_2h_prompts), 1) if recent_2h_prompts > 0 else float(totals.get('avg_prompt_score') or 0.0)
+
+    top_bn_title = top_bottlenecks[0]['title'] if top_bottlenecks else 'Duy trì Spec 1-Phát'
+    headline = (
+        f"Kỳ {period_label}: {len(seen_sessions)} phiên ({eval_cnt} lượt đã chấm) · "
+        f"Ăn ngay 1-Phát đạt {one_shot_rate_pct}% · "
+        f"Có thể tiết kiệm ~{est_savable_prompts} lượt (~{est_savable_hours}h) nếu khắc phục '{top_bn_title}'."
+    )
+
+    return {
+        'generated_at_iso': _utc_iso(),
+        'period_label': period_label,
+        'headline': headline,
+        'live_pulse': {
+            'running_sessions_count': len(running_list),
+            'running_sessions': running_list[:6],
+            'recent_2h_prompts': recent_2h_prompts,
+            'recent_2h_sessions': recent_2h_sess_cnt,
+            'recent_2h_avg_score': recent_2h_avg_score,
+            'recent_2h_tool_errors': recent_2h_terr,
+        },
+        'kpis': {
+            'evaluated_prompts': eval_cnt,
+            'one_shot_count': one_shot_cnt,
+            'one_shot_rate_pct': one_shot_rate_pct,
+            'weak_count': weak_cnt,
+            'rework_count': rework_cnt,
+            'rework_rate_pct': rework_rate_pct,
+            'est_savable_prompts': est_savable_prompts,
+            'est_savable_hours': est_savable_hours,
+            'dimension_avgs': dimension_avgs,
+            'weakest_dimensions': weakest_dims,
+        },
+        'top_bottlenecks': top_bottlenecks,
+        'by_project': by_project[:10],
+        'top_actionable_cases': top_actionable_cases,
+        'live_recent_turns': live_recent_turns,
+    }
+
+
 def build_dashboard_payload(
     period: str = '7d',
     target_date: str | None = None,
@@ -3300,6 +3748,7 @@ def build_dashboard_payload(
         tool_sess_sets: dict[str, set[str]] = {t: set() for t in VALID_TOOLS}
         spotlight_candidates: list[dict[str, Any]] = []
         all_enriched_prompts: list[dict[str, Any]] = []
+        session_prompt_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
         stage_totals: dict[str, int] = {}
         prompt_score_sum = 0.0
         prompt_score_cnt = 0
@@ -3603,6 +4052,7 @@ def build_dashboard_payload(
             s_item['ai_summary'] = str(ai_parsed.get('diagnosis') or '')
             s_item['ai_takeaway'] = str(ai_parsed.get('key_takeaway') or '')
             s_item['ai_analyzed_at'] = str(ai_parsed.get('analyzed_at') or '')
+            s_item['consolidated_prompt'] = str(ai_parsed.get('consolidated_prompt') or '')
             s_item['avg_prompt_score'] = p_stats['avg_prompt_score']
             s_item['weak_prompt_count'] = p_stats['weak_prompt_count']
             s_item['mergeable_count'] = p_stats['mergeable_count']
@@ -3615,6 +4065,8 @@ def build_dashboard_payload(
 
             if enriched_prompts:
                 all_enriched_prompts.extend(enriched_prompts)
+                for ep_item in enriched_prompts:
+                    session_prompt_pairs.append((s_item, ep_item))
                 for st_k, st_v in (p_stats.get('stage_counts') or {}).items():
                     stage_totals[st_k] = stage_totals.get(st_k, 0) + int(st_v or 0)
                 prompt_score_sum += float(p_stats['avg_prompt_score'])
@@ -3838,6 +4290,14 @@ def build_dashboard_payload(
             'prompt_lesson_spotlight': spotlight_final,
             'today_alerts': today_alerts[:5],
             'saved_prompts': saved_prompts,
+            'realtime_report': _build_realtime_executive_report(
+                seen_sessions,
+                session_prompt_pairs,
+                totals,
+                settings,
+                period_label,
+                now_epoch,
+            ),
             'ai_realtime': {
                 'enabled': bool(settings.get('auto_analyze_ai', True)),
                 'eligible_total': eligible_total,

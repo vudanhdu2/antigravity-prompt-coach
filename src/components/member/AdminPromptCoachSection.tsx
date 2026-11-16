@@ -36,6 +36,10 @@ import { showToast } from '../common/ToastContainer';
 import { copyToClipboard } from '../../utils/clipboard';
 import type { PortalTab } from './MemberPortalHelpers';
 import { AntigravityPcCoachTab } from './AntigravityPcCoachTab';
+import {
+    RealtimeExecutiveReportPanel,
+    type RealtimeExecutiveReport,
+} from './RealtimeExecutiveReportPanel';
 
 function readPersistedAdminToken(): string {
     if (typeof window === 'undefined') return '';
@@ -417,6 +421,7 @@ interface CoachDashboardResponse {
     prompt_lesson_spotlight?: PromptLessonSpotlightItem[];
     today_alerts: TodayAlertItem[];
     saved_prompts: SavedPromptItem[];
+    realtime_report?: RealtimeExecutiveReport;
     ai_realtime?: {
         enabled: boolean;
         eligible_total: number;
@@ -571,7 +576,7 @@ export interface AdminPromptCoachSectionProps {
 }
 
 type PeriodKey = 'today' | 'yesterday' | '7d' | '30d' | 'all' | 'date';
-type SubViewKey = 'overview' | 'ag_pc' | 'prompts' | 'sessions' | 'optimizer' | 'library';
+type SubViewKey = 'realtime' | 'overview' | 'ag_pc' | 'prompts' | 'sessions' | 'optimizer' | 'library';
 type SortByKey = 'priority' | 'period_prompts' | 'recent' | 'total_prompts' | 'hours_waste';
 type PromptTableSortKey = 'newest' | 'score_asc' | 'score_desc' | 'chars_desc' | 'errors_first';
 type KpiFilterKey = 'all' | 'over_limit' | 'savable';
@@ -2538,6 +2543,11 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
             <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-3.5 space-y-3 shadow-xs">
                 <div className="flex flex-wrap items-center gap-2">
                     {[
+                        {
+                            id: 'realtime' as SubViewKey,
+                            label: '⚡ Báo cáo Nhịp Realtime 30s',
+                            icon: '/icons/dopamine-3d/quest_lightning.png',
+                        },
                         { id: 'overview' as SubViewKey, label: '1. Bảng theo Ngày & Tổng quan', icon: '/icons/dopamine-3d/ui_calendar_heatmap.png' },
                         {
                             id: 'ag_pc' as SubViewKey,
@@ -2898,6 +2908,18 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                         </div>
                     )}
                 </div>
+            )}
+
+            {/* VIEW 0: REALTIME 30-SECOND EXECUTIVE REPORT */}
+            {dash && dash.realtime_report && subView === 'realtime' && (
+                <RealtimeExecutiveReportPanel
+                    report={dash.realtime_report}
+                    dark={typeof document !== 'undefined' && document.documentElement.classList.contains('dark')}
+                    copiedId={copiedId}
+                    onCopy={handleCopy}
+                    onOpenSessionTurn={(skey, turnIdx) => openInAntigravityPc(skey, turnIdx)}
+                    onLoadTemplateToComposer={tpl => navigateToOptimizerWithPrompt(tpl, 'all')}
+                />
             )}
 
             {/* VIEW 1: DAILY BREAKDOWN & PATTERN INSIGHTS */}
@@ -3269,6 +3291,7 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                     onToggleRealtimeAuto={() => setRealtimeAuto(v => !v)}
                     focusTurnIdx={agPcFocusTurnIdx}
                     onClearFocusTurnIdx={() => setAgPcFocusTurnIdx(null)}
+                    realtimeReport={dash.realtime_report}
                 />
             )}
 

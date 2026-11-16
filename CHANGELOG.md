@@ -4,6 +4,17 @@ Toàn bộ lịch sử phiên bản, ngày giờ phát hành (múi giờ Việt 
 
 ---
 
+## `v1.1.0` — Phát hành: `16/11/2026 14:21 (GMT+7)` · Commit `f974e2b`
+- **Bổ sung Báo cáo Nhịp Realtime 30 Giây (`RealtimeExecutiveReportPanel.tsx` & `realtime_report` API)**:
+  - Giúp nắm bắt toàn cảnh hiệu suất Prompt & Phiên trong 30 giây mà không cần đọc từng câu prompt:
+    1. **Nhịp sống tức thời (`live_pulse`)**: Danh sách phiên đang chạy trực tiếp (`4 chấm`), nhịp 2 giờ gần nhất và nút **Copy Báo cáo Tóm tắt Markdown 1-Chạm**.
+    2. **4 Chỉ số cốt lõi & Thanh nhiệt 7 Chiều Rubric**: Tỷ lệ Ăn ngay 1-Phát (`%`), Tỷ lệ phải sửa/nhắc vòng (`%`), Quỹ lượt & giờ có thể tiết kiệm, và điểm trung bình 7 chiều (`MT`, `NC`, `RG`, `RB`, `ĐR`, `KC`, `AT`).
+    3. **Quy luật Pareto 80/20 (`top_bottlenecks`)**: Tự động gom toàn bộ câu yếu/lỗi thành Top 3 điểm nghẽn lớn nhất kèm mẫu câu 1-Phát khắc phục ngay.
+    4. **Top 5 Ca Nóng Cần Xem Ngay (`top_actionable_cases`) & Ma trận Sức khỏe Dự án (`by_project`)**: Nhảy thẳng tới đúng phiên và đúng lượt câu lệnh cần xử lý chỉ bằng 1 cú bấm.
+    5. **Dòng chảy 15 Lượt Prompt Vừa Gửi (`live_recent_turns`)**: Băng chuyền thời gian thực đối chiếu câu gốc, thời gian AI thực thi (`turn_duration_s`), lỗi Tool và bản viết lại 1-Phát.
+
+---
+
 ## `v1.0.1` — Phát hành: `16/11/2026 12:47 (GMT+7)`
 - **Minh bạch hóa 100% số liệu & Nhật ký phát hành công khai**:
   - Bổ sung tệp `CHANGELOG.md` và bảng **Lịch sử phát hành & Các bản cập nhật** kèm ngày giờ + mã commit đối chiếu công khai trên cả GitHub lẫn cổng cộng đồng [https://aihot.vn](https://aihot.vn).
