@@ -19,6 +19,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +33,14 @@ AI_SCHEMA_VERSION = 3
 HOME_DIR = Path.home()
 DATA_DIR = Path(os.environ.get('PROMPT_COACH_DATA_DIR', str(HOME_DIR / '.antigravity_prompt_coach')))
 COACH_DB_PATH = os.environ.get('AG_PROMPT_COACH_DB', str(DATA_DIR / 'prompt_coach.db'))
+AG_INCIDENTS_LIVE_PATH = os.environ.get(
+    'AG_INCIDENTS_LIVE_PATH',
+    str(Path(COACH_DB_PATH).parent / 'ag_incidents_live.json'),
+)
+AG_INCIDENTS_HISTORY_DIR = os.environ.get(
+    'AG_INCIDENTS_HISTORY_DIR',
+    str(Path(COACH_DB_PATH).parent / 'ag-incidents-history'),
+)
 GUI_CONFIG_PATH = os.environ.get('AG_GUI_CONFIG_PATH', str(HOME_DIR / '.antigravity_tools' / 'gui_config.json'))
 LOCAL_PROXY_URL = os.environ.get('PROMPT_COACH_LLM_URL', 'http://127.0.0.1:8045/v1/chat/completions')
 LOCAL_PROXY_MODEL = os.environ.get('PROMPT_COACH_LLM_MODEL', 'gemini-2.5-flash')
@@ -423,6 +432,7 @@ def _ensure_coach_db(db_path: str | None = None) -> sqlite3.Connection:
             (now_iso,),
         )
         _migrate_coach_schema(con)
+        _ensure_search_fts_synced(con)
         _seed_default_saved_prompts(con, now_iso)
         ver_row = con.execute("SELECT value FROM coach_sync_meta WHERE key = 'rule_engine_version'").fetchone()
         if not ver_row or str(ver_row['value'] or '') != 'v3':
@@ -454,6 +464,240 @@ def _migrate_coach_schema(con: sqlite3.Connection) -> None:
     if added_last_act:
         con.execute('UPDATE coach_sessions SET last_activity_ts = end_ts WHERE last_activity_ts <= 0 AND end_ts > 0')
     con.execute('CREATE INDEX IF NOT EXISTS idx_coach_sessions_last_act ON coach_sessions(last_activity_ts DESC)')
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS coach_search_docs (
+            doc_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL UNIQUE,
+            search_sig TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS coach_search_fts USING fts5(
+            session_key UNINDEXED,
+            norm_text,
+            tokenize='unicode61'
+        )
+        """
+    )
+
+
+_COMB_MARKS_RE = re.compile(r'[\u0300-\u036f]+')
+_WS_COLLAPSE_RE = re.compile(r'\s+')
+_FTS_SUBTERM_RE = re.compile(r'[a-z0-9]+')
+
+
+def _normalize_search_text(text: Any) -> str:
+    s = str(text or '').strip().lower()
+    if not s:
+        return ''
+    s = unicodedata.normalize('NFD', s)
+    s = _COMB_MARKS_RE.sub('', s)
+    s = s.replace('đ', 'd')
+    return _WS_COLLAPSE_RE.sub(' ', s).strip()
+
+
+def _tokenize_search(query: Any, max_tokens: int = 8) -> list[str]:
+    norm = _normalize_search_text(query)
+    if not norm:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in norm.split(' '):
+        if not part or part in seen:
+            continue
+        seen.add(part)
+        out.append(part)
+        if len(out) >= max_tokens:
+            break
+    return out
+
+
+def _build_session_search_norm_text(
+    title: Any,
+    project: Any,
+    cwd: Any,
+    first_human_preview: Any,
+    prompts_sample_json: Any,
+    ai_analysis_json: Any,
+) -> str:
+    chunks: list[str] = []
+    for head in (title, project, cwd, first_human_preview):
+        if head:
+            chunks.append(redact_sensitive_text(str(head), 600))
+    try:
+        ai_obj = json.loads(ai_analysis_json or '{}') if isinstance(ai_analysis_json, str) else (ai_analysis_json or {})
+    except Exception:
+        ai_obj = {}
+    if isinstance(ai_obj, dict):
+        for k in ('diagnosis', 'key_takeaway', 'consolidated_prompt', 'split_strategy'):
+            val = ai_obj.get(k)
+            if val:
+                chunks.append(redact_sensitive_text(str(val), 1500))
+        rws = ai_obj.get('rewrite_pairs')
+        if isinstance(rws, list):
+            for rw in rws[:8]:
+                if isinstance(rw, dict):
+                    for rk in ('weak_original', 'upgraded_prompt', 'why_better'):
+                        rv = rw.get(rk)
+                        if rv:
+                            chunks.append(redact_sensitive_text(str(rv), 600))
+    try:
+        samples = json.loads(prompts_sample_json or '[]') if isinstance(prompts_sample_json, str) else (prompts_sample_json or [])
+    except Exception:
+        samples = []
+    if isinstance(samples, list):
+        for p in samples:
+            if not isinstance(p, dict):
+                continue
+            for pk in ('text_redacted', 'assistant_summary', 'assistant_err_snippet'):
+                pv = p.get(pk)
+                if pv:
+                    chunks.append(redact_sensitive_text(str(pv), 2000))
+            files = p.get('files_touched')
+            if isinstance(files, list) and files:
+                chunks.append(' '.join(str(f) for f in files[:24] if f))
+            tools = p.get('tools_triggered')
+            if isinstance(tools, list) and tools:
+                chunks.append(' '.join(str(t) for t in tools[:16] if t))
+    return _normalize_search_text(' '.join(chunks))
+
+
+def _sync_search_fts_rows(con: sqlite3.Connection, rows: list[sqlite3.Row]) -> int:
+    """Upsert normalized full-text search documents using O(log N) doc_id lookup."""
+    if not rows:
+        return 0
+    skeys = [str(r['session_key']) for r in rows]
+    existing: dict[str, tuple[int, str]] = {}
+    for i in range(0, len(skeys), 900):
+        chunk = skeys[i : i + 900]
+        q_marks = ','.join('?' for _ in chunk)
+        for er in con.execute(
+            f'SELECT doc_id, session_key, search_sig FROM coach_search_docs WHERE session_key IN ({q_marks})',
+            chunk,
+        ).fetchall():
+            existing[str(er['session_key'])] = (int(er['doc_id']), str(er['search_sig'] or ''))
+
+    updated = 0
+    for r in rows:
+        skey = str(r['session_key'])
+        norm_text = _build_session_search_norm_text(
+            r['title'],
+            r['project'],
+            r['cwd'],
+            r['first_human_preview'],
+            r['prompts_sample_json'],
+            r['ai_analysis_json'],
+        )
+        sig = hashlib.sha1(norm_text.encode('utf-8')).hexdigest()[:16]
+        prev = existing.get(skey)
+        if prev and prev[1] == sig:
+            continue
+        if prev:
+            doc_id = prev[0]
+            con.execute('UPDATE coach_search_docs SET search_sig = ? WHERE doc_id = ?', (sig, doc_id))
+            con.execute('DELETE FROM coach_search_fts WHERE rowid = ?', (doc_id,))
+        else:
+            cur = con.execute(
+                'INSERT INTO coach_search_docs (session_key, search_sig) VALUES (?, ?)',
+                (skey, sig),
+            )
+            doc_id = int(cur.lastrowid)
+        con.execute(
+            'INSERT INTO coach_search_fts (rowid, session_key, norm_text) VALUES (?, ?, ?)',
+            (doc_id, skey, norm_text),
+        )
+        updated += 1
+    return updated
+
+
+def _delete_search_fts_for_keys(con: sqlite3.Connection, session_keys: list[str]) -> int:
+    """Remove FTS & search doc rows for sessions marked is_fork_clone=1 or deleted."""
+    keys = [str(k) for k in session_keys if k]
+    if not keys:
+        return 0
+    deleted = 0
+    for i in range(0, len(keys), 500):
+        chunk = keys[i : i + 500]
+        q_marks = ','.join('?' for _ in chunk)
+        doc_rows = con.execute(
+            f'SELECT doc_id FROM coach_search_docs WHERE session_key IN ({q_marks})',
+            chunk,
+        ).fetchall()
+        doc_ids = [int(r['doc_id']) for r in doc_rows]
+        if not doc_ids:
+            continue
+        id_marks = ','.join('?' for _ in doc_ids)
+        con.execute(f'DELETE FROM coach_search_fts WHERE rowid IN ({id_marks})', doc_ids)
+        con.execute(f'DELETE FROM coach_search_docs WHERE doc_id IN ({id_marks})', doc_ids)
+        deleted += len(doc_ids)
+    return deleted
+
+
+def _sync_search_fts_for_keys(con: sqlite3.Connection, session_keys: list[str]) -> int:
+    keys = [str(k) for k in session_keys if k]
+    if not keys:
+        return 0
+    total = 0
+    for i in range(0, len(keys), 500):
+        chunk = keys[i : i + 500]
+        q_marks = ','.join('?' for _ in chunk)
+        rows = con.execute(
+            f"""
+            SELECT session_key, title, project, cwd, first_human_preview,
+                   prompts_sample_json, ai_analysis_json
+            FROM coach_sessions
+            WHERE is_fork_clone = 0 AND session_key IN ({q_marks})
+            """,
+            chunk,
+        ).fetchall()
+        active_keys = {str(r['session_key']) for r in rows}
+        stale_or_fork_keys = [k for k in chunk if k not in active_keys]
+        if stale_or_fork_keys:
+            _delete_search_fts_for_keys(con, stale_or_fork_keys)
+        total += _sync_search_fts_rows(con, rows)
+    return total
+
+
+def _ensure_search_fts_synced(con: sqlite3.Connection) -> None:
+    # Prune any search docs belonging to sessions that became is_fork_clone = 1 or were deleted
+    stale_fork_docs = con.execute(
+        """
+        SELECT d.session_key
+        FROM coach_search_docs d
+        LEFT JOIN coach_sessions s ON s.session_key = d.session_key
+        WHERE s.session_key IS NULL OR COALESCE(s.is_fork_clone, 0) != 0
+        """
+    ).fetchall()
+    if stale_fork_docs:
+        _delete_search_fts_for_keys(con, [str(r['session_key']) for r in stale_fork_docs])
+
+    missing_rows = con.execute(
+        """
+        SELECT s.session_key, s.title, s.project, s.cwd, s.first_human_preview,
+               s.prompts_sample_json, s.ai_analysis_json
+        FROM coach_sessions s
+        LEFT JOIN coach_search_docs d ON d.session_key = s.session_key
+        WHERE s.is_fork_clone = 0 AND d.session_key IS NULL
+        LIMIT 2000
+        """
+    ).fetchall()
+    while missing_rows:
+        _sync_search_fts_rows(con, missing_rows)
+        if len(missing_rows) < 2000:
+            break
+        missing_rows = con.execute(
+            """
+            SELECT s.session_key, s.title, s.project, s.cwd, s.first_human_preview,
+                   s.prompts_sample_json, s.ai_analysis_json
+            FROM coach_sessions s
+            LEFT JOIN coach_search_docs d ON d.session_key = s.session_key
+            WHERE s.is_fork_clone = 0 AND d.session_key IS NULL
+            LIMIT 2000
+            """
+        ).fetchall()
 
 
 def _seed_default_saved_prompts(con: sqlite3.Connection, now_iso: str) -> None:
@@ -1955,6 +2199,7 @@ def analyze_and_persist_session(
                 'UPDATE coach_sessions SET ai_hash = ?, ai_analysis_json = ?, updated_at = ? WHERE session_key = ?',
                 (analyzed_content_hash, json.dumps(ai_res, ensure_ascii=False), _utc_iso(), session_key),
             )
+            _sync_search_fts_for_keys(con, [session_key])
             con.commit()
         finally:
             con.close()
@@ -2197,7 +2442,7 @@ def _build_clarifying_questions(
         qs.append({
             'id': 'target_scope',
             'question': 'Nhiệm vụ này tác động đúng file, route hay bảng dữ liệu nào?',
-            'placeholder': 'Ví dụ: scripts/ag_owner_prompt_coach.py hoặc /admin',
+            'placeholder': 'Ví dụ: coach_engine.py hoặc /admin',
             'suggestions': [
                 'Frontend UI (React/Tailwind)',
                 'Backend Python API + SQLite',
@@ -2932,6 +3177,7 @@ def ingest_payload(body: dict[str, Any], owner_uname: str = 'local_member', db_p
                 upserted = len(session_upsert_params)
                 day_rows_written = len(all_day_tuples)
 
+            _sync_search_fts_for_keys(con, [it['skey'] for it in prepared_items])
             con.executemany('INSERT OR REPLACE INTO coach_sync_meta (key, value) VALUES (?, ?)', meta_rows)
             con.commit()
             if settings.get('auto_analyze_ai', True) and stale_recent_direct:
@@ -4416,6 +4662,431 @@ def get_session_detail(session_key: str, db_path: str | None = None) -> dict[str
         con.close()
 
 
+def _build_matched_snippet(raw_text: str, q_tokens: list[str], max_len: int = 200) -> str:
+    clean = _WS_COLLAPSE_RE.sub(' ', str(raw_text or '')).strip()
+    if not clean:
+        return ''
+    if len(clean) <= max_len:
+        return redact_sensitive_text(clean, max_len)
+    norm_chars: list[str] = []
+    starts: list[int] = []
+    i = 0
+    n = len(clean)
+    while i < n:
+        j = i + 1
+        while j < n and 0x0300 <= ord(clean[j]) <= 0x036F:
+            j += 1
+        ch = unicodedata.normalize('NFD', clean[i:j].lower())
+        ch = _COMB_MARKS_RE.sub('', ch).replace('đ', 'd')
+        for c in ch:
+            norm_chars.append(c)
+            starts.append(i)
+        i = j
+    norm_str = ''.join(norm_chars)
+    hit_pos = -1
+    for tok in q_tokens:
+        if not tok:
+            continue
+        p = norm_str.find(tok)
+        if p >= 0 and (hit_pos < 0 or p < hit_pos):
+            hit_pos = p
+    if hit_pos < 0:
+        return redact_sensitive_text(clean[:max_len].rstrip() + '…', max_len + 10)
+    orig_pos = starts[hit_pos]
+    half = max(32, (max_len - 20) // 2)
+    win_start = max(0, orig_pos - half)
+    win_end = min(len(clean), win_start + max_len)
+    if win_end - win_start < max_len:
+        win_start = max(0, win_end - max_len)
+    while 0 < win_start < len(clean) and 0x0300 <= ord(clean[win_start]) <= 0x036F:
+        win_start += 1
+    while win_end < len(clean) and 0x0300 <= ord(clean[win_end]) <= 0x036F:
+        win_end += 1
+    if win_start > 0:
+        sp = clean.find(' ', win_start, min(len(clean), win_start + 16))
+        if sp > win_start and sp < orig_pos:
+            win_start = sp + 1
+    if win_end < len(clean):
+        sp = clean.rfind(' ', max(win_start, win_end - 16), win_end)
+        if sp > orig_pos:
+            win_end = sp
+    frag = clean[win_start:win_end].strip()
+    if win_start > 0:
+        frag = '…' + frag
+    if win_end < len(clean):
+        frag = frag + '…'
+    return redact_sensitive_text(frag, max_len + 12)
+
+
+def _evaluate_session_search_match(row: sqlite3.Row, q_tokens: list[str], phrase: str) -> dict[str, Any] | None:
+    norm_all = str(row['norm_text'] or '')
+    if not all(tok in norm_all for tok in q_tokens):
+        return None
+    title_raw = str(row['title'] or '')
+    preview_raw = str(row['first_human_preview'] or '')
+    proj_raw = str(row['project'] or '')
+    cwd_raw = str(row['cwd'] or '')
+    title_norm = _normalize_search_text(title_raw)
+    preview_norm = _normalize_search_text(preview_raw)
+    proj_norm = _normalize_search_text(f'{proj_raw} {cwd_raw}')
+
+    try:
+        ai_obj = json.loads(row['ai_analysis_json'] or '{}')
+        if not isinstance(ai_obj, dict):
+            ai_obj = {}
+    except Exception:
+        ai_obj = {}
+    try:
+        samples = json.loads(row['prompts_sample_json'] or '[]')
+        if not isinstance(samples, list):
+            samples = []
+    except Exception:
+        samples = []
+
+    ai_text = ' '.join(
+        str(ai_obj.get(k) or '')
+        for k in ('diagnosis', 'key_takeaway', 'consolidated_prompt', 'split_strategy')
+        if ai_obj.get(k)
+    )
+    ai_norm = _normalize_search_text(ai_text)
+
+    score = 10.0
+    if phrase and phrase == title_norm:
+        score += 140.0
+    elif phrase and phrase in title_norm:
+        score += 90.0
+    elif all(t in title_norm for t in q_tokens):
+        score += 65.0
+    elif any(t in title_norm for t in q_tokens):
+        score += 22.0
+
+    if all(t in proj_norm for t in q_tokens):
+        score += 36.0
+    elif any(t in proj_norm for t in q_tokens):
+        score += 12.0
+
+    if ai_norm:
+        if all(t in ai_norm for t in q_tokens):
+            score += 32.0
+        elif any(t in ai_norm for t in q_tokens):
+            score += 10.0
+
+    matched_turn_idx: int | None = None
+    best_turn_rank = -1
+    best_turn_raw = ''
+    best_turn_zone = 'prompt'
+    match_count = 0
+
+    if title_norm and any(t in title_norm for t in q_tokens):
+        match_count += sum(1 for t in q_tokens if t in title_norm)
+    if ai_norm and any(t in ai_norm for t in q_tokens):
+        match_count += sum(1 for t in q_tokens if t in ai_norm)
+
+    for p in samples:
+        if not isinstance(p, dict):
+            continue
+        try:
+            t_idx = int(p.get('idx') or 0) or None
+        except Exception:
+            t_idx = None
+        p_txt = str(p.get('text_redacted') or '')
+        a_sum = str(p.get('assistant_summary') or '')
+        a_err = str(p.get('assistant_err_snippet') or '')
+        files_s = ' '.join(str(f) for f in (p.get('files_touched') or []) if f)
+        tools_s = ' '.join(str(t) for t in (p.get('tools_triggered') or []) if t)
+
+        n_p = _normalize_search_text(p_txt)
+        n_a = _normalize_search_text(f'{a_sum} {a_err}')
+        n_f = _normalize_search_text(f'{files_s} {tools_s}')
+        n_turn = f'{n_p} {n_a} {n_f}'.strip()
+        if not n_turn:
+            continue
+        tok_hits = sum(1 for t in q_tokens if t in n_turn)
+        if tok_hits <= 0:
+            continue
+        match_count += 1
+        all_in_turn = tok_hits == len(q_tokens)
+        zone = 'prompt'
+        zone_raw = p_txt
+        if phrase and phrase in n_p:
+            rank = 120
+        elif all_in_turn and all(t in n_p for t in q_tokens):
+            rank = 95
+        elif all_in_turn:
+            rank = 75
+            if not any(t in n_p for t in q_tokens):
+                if any(t in n_f for t in q_tokens):
+                    zone = 'file'
+                    zone_raw = files_s or tools_s
+                else:
+                    zone = 'assistant'
+                    zone_raw = a_err or a_sum
+        else:
+            rank = 20 + tok_hits * 8
+            if not any(t in n_p for t in q_tokens):
+                if any(t in n_f for t in q_tokens):
+                    zone = 'file'
+                    zone_raw = files_s or tools_s
+                elif any(t in n_a for t in q_tokens):
+                    zone = 'assistant'
+                    zone_raw = a_err or a_sum
+
+        if rank > best_turn_rank:
+            best_turn_rank = rank
+            matched_turn_idx = t_idx
+            best_turn_raw = zone_raw or p_txt or a_sum or a_err or files_s
+            best_turn_zone = zone
+
+    score += min(64.0, match_count * 12.0) + (best_turn_rank * 0.2 if best_turn_rank > 0 else 0.0)
+    last_act = max(float(row['end_ts'] or 0.0), float(row['last_activity_ts'] or 0.0))
+    now_epoch = time.time()
+    if last_act > 0:
+        age_days = max(0.0, (now_epoch - last_act) / 86400.0)
+        score += max(0.0, 20.0 - min(20.0, age_days * 0.5))
+
+    # Choose best matched_in label and raw snippet source
+    if all(t in title_norm for t in q_tokens):
+        matched_in = 'title'
+        snip_raw = best_turn_raw if best_turn_rank >= 75 else (title_raw or preview_raw)
+    elif best_turn_rank > 0:
+        matched_in = best_turn_zone
+        snip_raw = best_turn_raw
+    elif all(t in ai_norm for t in q_tokens) or (ai_norm and any(t in ai_norm for t in q_tokens)):
+        matched_in = 'ai'
+        snip_raw = ai_text
+    elif all(t in proj_norm for t in q_tokens) or any(t in proj_norm for t in q_tokens):
+        matched_in = 'project'
+        snip_raw = f'{proj_raw} · {cwd_raw}' if cwd_raw else proj_raw
+    else:
+        matched_in = 'prompt'
+        snip_raw = preview_raw or title_raw or ai_text
+
+    return {
+        'score': round(score, 2),
+        'matched_in': matched_in,
+        'matched_turn_idx': matched_turn_idx,
+        'match_count': max(1, match_count),
+        'matched_snippet': _build_matched_snippet(snip_raw, q_tokens, max_len=210),
+    }
+
+
+def search_sessions(
+    q: str = '',
+    period: str = 'all',
+    target_date: str | None = None,
+    tool_filter: str = 'all',
+    include_sub: bool = True,
+    severity_filter: str = 'all',
+    limit: int = 60,
+    db_path: str | None = None,
+) -> dict[str, Any]:
+    """Tìm kiếm toàn văn tiếng Việt không dấu/có dấu trên toàn bộ kho coach_sessions qua FTS5."""
+    t0 = time.monotonic()
+    q_tokens = _tokenize_search(q, max_tokens=8)
+    limit_n = max(1, min(150, int(limit or 60)))
+    if not q_tokens:
+        return {
+            'ok': True,
+            'q': str(q or ''),
+            'period': period,
+            'total_hits': 0,
+            'elapsed_ms': 0.0,
+            'items': [],
+        }
+
+    resolved_db = os.path.abspath(str(db_path or os.environ.get('AG_PROMPT_COACH_DB', COACH_DB_PATH)))
+    con = _ensure_coach_db(db_path)
+    try:
+        # Bảo đảm dữ liệu FTS được đồng bộ nếu bảng vừa khởi tạo
+        _ensure_search_fts_synced(con)
+        settings = get_settings(con)
+        settings_sig = _settings_cache_sig(settings)
+        start_d, end_d, _ = _resolve_date_window(period, target_date)
+        tool_f = (tool_filter or 'all').strip().lower()
+        if tool_f not in (*VALID_TOOLS, 'all'):
+            tool_f = 'all'
+        sev_f = (severity_filter or 'all').strip().lower()
+
+        where_parts = ['s.is_fork_clone = 0']
+        meta_params: list[Any] = []
+        if start_d and end_d:
+            where_parts.append(
+                'EXISTS (SELECT 1 FROM coach_day_sessions ds WHERE ds.session_key = s.session_key AND ds.day >= ? AND ds.day <= ?)'
+            )
+            meta_params.extend([start_d, end_d])
+        if tool_f != 'all':
+            where_parts.append('s.tool = ?')
+            meta_params.append(tool_f)
+        if not include_sub:
+            where_parts.append('s.is_sub = 0')
+        if sev_f in ('red', 'amber', 'green'):
+            where_parts.append('s.severity = ?')
+            meta_params.append(sev_f)
+        meta_sql = ' AND '.join(where_parts)
+
+        fts_terms: list[str] = []
+        for tok in q_tokens:
+            for sub in _FTS_SUBTERM_RE.findall(tok):
+                if sub:
+                    fts_terms.append(f'"{sub}"*')
+
+        select_cols = """
+            s.session_key, s.tool, s.title, s.project, s.cwd, s.is_sub,
+            s.start_day, s.end_day, s.start_ts, s.end_ts, s.last_activity_ts,
+            s.is_running, s.is_pinned,
+            s.n_human_prompts, s.clean_active_hours,
+            s.n_short_nudges, s.n_vague_errors, s.n_corr_kw,
+            s.total_tool_calls, s.max_consecutive_tool_calls, s.tool_error_count, s.redirection_count,
+            s.first_human_preview, s.first_human_len,
+            s.rule_score, s.severity, s.flags_json,
+            s.prompts_sample_json, s.ai_analysis_json,
+            s.content_hash, s.ai_hash,
+            f.norm_text
+        """
+
+        cand_limit = max(250, min(600, limit_n * 8))
+        cand_rows: list[sqlite3.Row] = []
+        seen_cands: set[str] = set()
+
+        if fts_terms:
+            fts_expr = ' AND '.join(fts_terms)
+            try:
+                rows_fts = con.execute(
+                    f"""
+                    SELECT {select_cols}
+                    FROM coach_search_fts f
+                    JOIN coach_sessions s ON s.session_key = f.session_key
+                    WHERE f.norm_text MATCH ? AND {meta_sql}
+                    ORDER BY s.last_activity_ts DESC, s.end_ts DESC
+                    LIMIT ?
+                    """,
+                    [fts_expr, *meta_params, cand_limit],
+                ).fetchall()
+                for rr in rows_fts:
+                    sk = str(rr['session_key'])
+                    if sk not in seen_cands:
+                        seen_cands.add(sk)
+                        cand_rows.append(rr)
+            except Exception:
+                cand_rows = []
+
+        # Fallback quét LIKE cho chuỗi ký tự đặc biệt hoặc cắt giữa từ khi FTS chưa khớp đủ
+        if not cand_rows:
+            longest_tok = max(q_tokens, key=len)
+            like_pat = f'%{longest_tok}%'
+            rows_like = con.execute(
+                f"""
+                SELECT {select_cols}
+                FROM coach_search_fts f
+                JOIN coach_sessions s ON s.session_key = f.session_key
+                WHERE f.norm_text LIKE ? AND {meta_sql}
+                ORDER BY s.last_activity_ts DESC, s.end_ts DESC
+                LIMIT ?
+                """,
+                [like_pat, *meta_params, cand_limit],
+            ).fetchall()
+            for rr in rows_like:
+                sk = str(rr['session_key'])
+                if sk not in seen_cands:
+                    seen_cands.add(sk)
+                    cand_rows.append(rr)
+
+        phrase = ' '.join(q_tokens)
+        scored: list[tuple[float, float, sqlite3.Row, dict[str, Any]]] = []
+        for rr in cand_rows:
+            meta_m = _evaluate_session_search_match(rr, q_tokens, phrase)
+            if not meta_m:
+                continue
+            last_act = max(float(rr['end_ts'] or 0.0), float(rr['last_activity_ts'] or 0.0))
+            scored.append((float(meta_m['score']), last_act, rr, meta_m))
+
+        scored.sort(key=lambda x: (-x[0], -x[1]))
+        total_hits = len(scored)
+        top_hits = scored[:limit_n]
+        now_epoch = time.time()
+
+        items: list[dict[str, Any]] = []
+        for _, last_act, rr, meta_m in top_hits:
+            has_ai, ai_fresh, ai_parsed, _, p_stats = _get_or_eval_session_prompts(
+                resolved_db,
+                rr,
+                settings,
+                settings_sig,
+                cache_insert=False,
+                shallow_copy=False,
+            )
+            try:
+                flags_parsed = json.loads(rr['flags_json'] or '[]')
+            except Exception:
+                flags_parsed = []
+            n_hp = int(rr['n_human_prompts'] or 0)
+            c_hrs = round(float(rr['clean_active_hours'] or 0.0), 2)
+            items.append({
+                'session_key': str(rr['session_key']),
+                'tool': str(rr['tool'] or ''),
+                'title': str(rr['title'] or ''),
+                'project': str(rr['project'] or ''),
+                'is_sub': bool(int(rr['is_sub'] or 0)),
+                'start_day': str(rr['start_day'] or ''),
+                'end_day': str(rr['end_day'] or ''),
+                'start_ts': float(rr['start_ts'] or 0.0),
+                'end_ts': float(rr['end_ts'] or 0.0),
+                'last_activity_ts': last_act,
+                'is_running': bool(int(rr['is_running'] or 0)) and ((now_epoch - last_act) < 900.0),
+                'is_pinned': bool(int(rr['is_pinned'] or 0)),
+                'day_human_prompts': n_hp,
+                'day_active_hours': c_hrs,
+                'period_human_prompts': n_hp,
+                'period_active_hours': c_hrs,
+                'n_human_prompts': n_hp,
+                'clean_active_hours': c_hrs,
+                'n_short_nudges': int(rr['n_short_nudges'] or 0),
+                'n_vague_errors': int(rr['n_vague_errors'] or 0),
+                'n_corr_kw': int(rr['n_corr_kw'] or 0),
+                'total_tool_calls': int(rr['total_tool_calls'] or 0),
+                'max_consecutive_tool_calls': int(rr['max_consecutive_tool_calls'] or 0),
+                'tool_error_count': int(rr['tool_error_count'] or 0),
+                'redirection_count': int(rr['redirection_count'] or 0),
+                'first_human_preview': str(rr['first_human_preview'] or ''),
+                'first_human_len': int(rr['first_human_len'] or 0),
+                'rule_score': int(rr['rule_score'] or 100),
+                'severity': str(rr['severity'] or 'green'),
+                'flags': flags_parsed,
+                'has_ai_analysis': has_ai,
+                'ai_is_fresh': ai_fresh,
+                'ai_analyzing': False,
+                'ai_summary': str(ai_parsed.get('diagnosis') or ''),
+                'ai_takeaway': str(ai_parsed.get('key_takeaway') or ''),
+                'consolidated_prompt': str(ai_parsed.get('consolidated_prompt') or ''),
+                'ai_analyzed_at': str(ai_parsed.get('analyzed_at') or ''),
+                'avg_prompt_score': p_stats['avg_prompt_score'],
+                'weak_prompt_count': p_stats['weak_prompt_count'],
+                'mergeable_count': p_stats['mergeable_count'],
+                'ai_scored_count': p_stats['ai_scored_count'],
+                'prompt_scores_mini': p_stats['prompt_scores_mini'],
+                'scored_prompts_preview': p_stats['scored_prompts_preview'],
+                'top_prompt_lesson': p_stats['top_prompt_lesson'],
+                'focus_habit': p_stats.get('focus_habit'),
+                'stage_counts': p_stats.get('stage_counts', {}),
+                'matched_in': meta_m['matched_in'],
+                'matched_turn_idx': meta_m['matched_turn_idx'],
+                'match_count': meta_m['match_count'],
+                'matched_snippet': meta_m['matched_snippet'],
+                'match_score': meta_m['score'],
+            })
+
+        return {
+            'ok': True,
+            'q': str(q or ''),
+            'period': period,
+            'total_hits': total_hits,
+            'elapsed_ms': round((time.monotonic() - t0) * 1000.0, 2),
+            'items': items,
+        }
+    finally:
+        con.close()
+
+
 def list_scored_prompts(
     period: str = '7d',
     target_date: str | None = None,
@@ -4519,7 +5190,7 @@ def list_scored_prompts(
                     )
                     eval_by_key[sk] = (has_ai_b, ep_b)
 
-        q_low = (q or '').strip().lower()
+        q_tokens = _tokenize_search(q, max_tokens=8)
         stage_f = (stage or 'all').strip().lower()
         level_f = (level or 'all').strip().lower()
         weak_f = (weak_dim or 'all').strip().lower()
@@ -4564,8 +5235,8 @@ def list_scored_prompts(
                 p_day = str(p.get('day') or sess_end_day)
                 if start_d and end_d and p_day and not (start_d <= p_day <= end_d):
                     continue
-                if q_low:
-                    hay = ' '.join([
+                if q_tokens:
+                    hay = _normalize_search_text(' '.join([
                         str(p.get('text_redacted') or ''),
                         str(p.get('improved_prompt') or ''),
                         str(p.get('lesson') or ''),
@@ -4577,8 +5248,8 @@ def list_scored_prompts(
                         ' '.join(str(t) for t in (p.get('tools_triggered') or [])),
                         sess_title,
                         sess_project,
-                    ]).lower()
-                    if q_low not in hay:
+                    ]))
+                    if not all(tok in hay for tok in q_tokens):
                         continue
 
                 total_unfiltered += 1
@@ -4975,6 +5646,134 @@ def get_day_detail(
         con.close()
 
 
+def _sanitize_ag_incidents_doc(doc: dict[str, Any]) -> dict[str, Any]:
+    """Layer-2 defense-in-depth redaction for owner Antigravity realtime incident snapshots."""
+    for ev in doc.get('events') or []:
+        if isinstance(ev, dict):
+            if ev.get('promptSnippet'):
+                ev['promptSnippet'] = redact_sensitive_text(ev['promptSnippet'], 160)
+            if ev.get('message'):
+                ev['message'] = redact_sensitive_text(ev['message'], 280)
+            if ev.get('title'):
+                ev['title'] = redact_sensitive_text(ev['title'], 120)
+    for rt in doc.get('retryingNow') or []:
+        if isinstance(rt, dict):
+            if rt.get('promptSnippet'):
+                rt['promptSnippet'] = redact_sensitive_text(rt['promptSnippet'], 160)
+            if rt.get('rawError'):
+                rt['rawError'] = redact_sensitive_text(rt['rawError'], 240)
+    for st in doc.get('stalledTurns') or []:
+        if isinstance(st, dict) and st.get('promptSnippet'):
+            st['promptSnippet'] = redact_sensitive_text(st['promptSnippet'], 160)
+    for sw in doc.get('modelSwitches') or []:
+        if isinstance(sw, dict) and sw.get('promptSnippet'):
+            sw['promptSnippet'] = redact_sensitive_text(sw['promptSnippet'], 160)
+    return doc
+
+
+def _read_ag_incidents_snapshot(req_date: str | None = None) -> dict[str, Any]:
+    live_p = Path(AG_INCIDENTS_LIVE_PATH)
+    hist_dir = Path(AG_INCIDENTS_HISTORY_DIR)
+    avail_dates: set[str] = set()
+    if hist_dir.is_dir():
+        for fp in hist_dir.glob('*.json'):
+            if re.fullmatch(r'\d{4}-\d{2}-\d{2}', fp.stem):
+                avail_dates.add(fp.stem)
+
+    live_doc: dict[str, Any] | None = None
+    if live_p.is_file():
+        try:
+            cand = json.loads(live_p.read_text(encoding='utf-8', errors='replace'))
+            if isinstance(cand, dict) and cand.get('date'):
+                live_doc = cand
+                avail_dates.add(str(cand['date']))
+        except Exception:
+            live_doc = None
+
+    now_ep = time.time()
+    doc: dict[str, Any] | None = None
+    if req_date and re.fullmatch(r'\d{4}-\d{2}-\d{2}', req_date):
+        if live_doc and live_doc.get('date') == req_date:
+            doc = live_doc
+        else:
+            hist_p = hist_dir / f'{req_date}.json'
+            if hist_p.is_file():
+                try:
+                    doc = json.loads(hist_p.read_text(encoding='utf-8', errors='replace'))
+                except Exception:
+                    doc = None
+    else:
+        doc = live_doc
+
+    if not isinstance(doc, dict):
+        return {
+            'ok': True,
+            'empty': True,
+            'date': req_date or dt.datetime.now(VN_TZ).strftime('%Y-%m-%d'),
+            'availableDates': sorted(avail_dates, reverse=True),
+            'pcOnline': False,
+            'pcAgeSeconds': None,
+            'healthStatus': {
+                'tone': 'offline',
+                'label': 'Chưa nhận được gói telemetry từ PC',
+                'recent30mErrors': 0,
+                'retryingNowCount': 0,
+                'stalledTurnsCount': 0,
+                'bridgeOnline': False,
+            },
+            'todaySummary': {
+                'totalErrors': 0,
+                'affectedConversations': 0,
+                'quota429Errors': 0,
+                'auth401Errors': 0,
+                'timeoutErrors': 0,
+                'capacity503Errors': 0,
+                'networkErrors': 0,
+                'modelSwitchesCount': 0,
+                'errorTriggeredSwitches': 0,
+                'recoveredAfterSwitch': 0,
+            },
+            'retryingNow': [],
+            'stalledTurns': [],
+            'categoriesBreakdown': [],
+            'modelHealth': [],
+            'modelSwitches': [],
+            'events': [],
+            'remoteCmdSummary': {'total': 0, 'delivered': 0, 'failed': 0, 'pendingOrInProgress': 0, 'stuckPending': [], 'recentFailures': []},
+            'quotaStatus': {'available': False, 'accounts': []},
+            'authWarnings': [],
+            'systemEvents': [],
+            'recommendations': [],
+        }
+
+    gen_ep = float(doc.get('generatedAtEpoch') or doc.get('receivedAtEpoch') or 0.0)
+    age_s = max(0, int(round(now_ep - gen_ep))) if gen_ep > 0 else None
+    doc['pcAgeSeconds'] = age_s
+    doc['pcOnline'] = bool(age_s is not None and age_s <= 60)
+    doc['availableDates'] = sorted(avail_dates, reverse=True)
+    # Recompute live retry countdown against current server wall-clock
+    fresh_retries = []
+    for rt in doc.get('retryingNow') or []:
+        if not isinstance(rt, dict):
+            continue
+        eta_ep = float(rt.get('retryEtaEpoch') or 0.0)
+        if eta_ep > 0 and now_ep <= eta_ep + 340.0:
+            rt_copy = dict(rt)
+            rem = eta_ep - now_ep
+            nxt = min(9, int(rt_copy.get('attempt') or 1) + 1)
+            if rem > 1.0:
+                rt_copy['phase'] = 'waiting_backoff'
+                rt_copy['countdownSec'] = int(round(rem))
+                rt_copy['phaseLabel'] = f'Chờ {int(round(rem))}s trước lần {nxt}/9'
+            else:
+                rt_copy['phase'] = 'attempt_running'
+                rt_copy['countdownSec'] = 0
+                rt_copy['phaseLabel'] = f'Đang chạy lần {nxt}/9 ({max(0, int(round(now_ep - eta_ep)))}s)'
+            fresh_retries.append(rt_copy)
+    doc['retryingNow'] = fresh_retries
+    return doc
+
+
 def handle_prompt_coach_request(
     method: str,
     parsed_path: str,
@@ -5014,6 +5813,32 @@ def handle_prompt_coach_request(
             return (200, payload)
         except Exception as exc:
             return (500, {'ok': False, 'error': f'Lỗi đọc dữ liệu A12: {exc}'})
+
+    # 1a. GET /api/owner/prompt-coach/search (Tìm kiếm toàn văn FTS5 tiếng Việt không dấu/có dấu)
+    if parsed_path == '/api/owner/prompt-coach/search' and cmd == 'GET':
+        q_str = (qs.get('q') or [''])[0]
+        period = (qs.get('period') or ['all'])[0]
+        target_date = (qs.get('date') or [None])[0]
+        tool = (qs.get('tool') or ['all'])[0]
+        include_sub = ((qs.get('include_sub') or ['1'])[0]) != '0'
+        sev = (qs.get('severity') or ['all'])[0]
+        try:
+            limit_num = int((qs.get('limit') or ['60'])[0] or '60')
+        except Exception:
+            limit_num = 60
+        try:
+            payload = search_sessions(
+                q=q_str,
+                period=period,
+                target_date=target_date,
+                tool_filter=tool,
+                include_sub=include_sub,
+                severity_filter=sev,
+                limit=limit_num,
+            )
+            return (200, payload)
+        except Exception as exc:
+            return (500, {'ok': False, 'error': f'Lỗi tìm kiếm A12: {exc}'})
 
     # 1b. GET /api/owner/prompt-coach/prompts (Bảng chi tiết toàn bộ câu prompt + chấm điểm 7 chiều + gợi ý tối ưu)
     if parsed_path == '/api/owner/prompt-coach/prompts' and cmd == 'GET':
@@ -5099,8 +5924,22 @@ def handle_prompt_coach_request(
             finally:
                 con.close()
 
+    # 3b. GET /api/owner/prompt-coach/ag-incidents (Giám sát sự cố Antigravity Realtime)
+    if parsed_path == '/api/owner/prompt-coach/ag-incidents' and cmd == 'GET':
+        req_date = (qs.get('date') or [None])[0]
+        try:
+            payload = _read_ag_incidents_snapshot(req_date=req_date)
+            payload['owner'] = owner_uname
+            return (200, payload)
+        except Exception as exc:
+            return (500, {'ok': False, 'error': f'Lỗi đọc telemetry sự cố AG: {exc}'})
+
     # Parse JSON body for write endpoints
-    max_body = 4 * 1024 * 1024 if parsed_path == '/api/owner/prompt-coach/ingest' else 131072
+    max_body = (
+        4 * 1024 * 1024
+        if parsed_path in ('/api/owner/prompt-coach/ingest', '/api/owner/prompt-coach/ag-incidents')
+        else 131072
+    )
     if len(req_body or b'') > max_body:
         return (413, {'ok': False, 'error': 'Dữ liệu gửi lên vượt quá dung lượng cho phép.'})
     try:
@@ -5109,6 +5948,40 @@ def handle_prompt_coach_request(
             return (400, {'ok': False, 'error': 'Body phải là JSON object.'})
     except Exception:
         return (400, {'ok': False, 'error': 'JSON không hợp lệ.'})
+
+    # 5a. POST /api/owner/prompt-coach/ag-incidents (PC đẩy telemetry sự cố Antigravity Realtime)
+    if parsed_path == '/api/owner/prompt-coach/ag-incidents' and cmd == 'POST':
+        day_str = str(body.get('date') or '').strip()
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', day_str):
+            return (422, {'ok': False, 'error': 'Thiếu hoặc sai định dạng ngày YYYY-MM-DD.'})
+        try:
+            clean_doc = _sanitize_ag_incidents_doc(body)
+            clean_doc['receivedAtEpoch'] = round(time.time(), 2)
+            with _WRITE_LOCK:
+                live_p = Path(AG_INCIDENTS_LIVE_PATH)
+                live_p.parent.mkdir(parents=True, exist_ok=True)
+                raw_json = json.dumps(clean_doc, ensure_ascii=False, separators=(',', ':'))
+                tmp_live = live_p.with_name(f'{live_p.name}.tmp.{os.getpid()}')
+                tmp_live.write_text(raw_json, encoding='utf-8')
+                os.replace(tmp_live, live_p)
+
+                hist_dir = Path(AG_INCIDENTS_HISTORY_DIR)
+                hist_dir.mkdir(parents=True, exist_ok=True)
+                hist_p = hist_dir / f'{day_str}.json'
+                tmp_hist = hist_p.with_name(f'{hist_p.name}.tmp.{os.getpid()}')
+                tmp_hist.write_text(raw_json, encoding='utf-8')
+                os.replace(tmp_hist, hist_p)
+            return (
+                200,
+                {
+                    'ok': True,
+                    'date': day_str,
+                    'totalErrors': int((clean_doc.get('todaySummary') or {}).get('totalErrors') or 0),
+                    'retryingNow': len(clean_doc.get('retryingNow') or []),
+                },
+            )
+        except Exception as exc:
+            return (500, {'ok': False, 'error': f'Lỗi lưu snapshot sự cố AG: {exc}'})
 
     # 5. POST /api/owner/prompt-coach/ingest (từ PC collector)
     if parsed_path == '/api/owner/prompt-coach/ingest' and cmd == 'POST':

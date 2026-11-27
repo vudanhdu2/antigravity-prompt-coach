@@ -56,6 +56,12 @@ AG_BRAIN_DIR = HOME / '.gemini' / 'antigravity' / 'brain'
 AG_SUMMARIES_DB = HOME / '.gemini' / 'antigravity' / 'conversation_summaries.db'
 AG_ANNOTATIONS_DIR = HOME / '.gemini' / 'antigravity' / 'annotations'
 AG_PROJECTS_CFG_DIR = HOME / '.gemini' / 'config' / 'projects'
+_AG2_ENV = str(os.environ.get('PROMPT_COACH_AG2_HOME') or '').strip()
+AG2_HOME = Path(_AG2_ENV) if _AG2_ENV else (DATA_DIR / '__disabled_secondary_profile__')
+AG2_BRAIN_DIR = AG2_HOME / '.gemini' / 'antigravity' / 'brain'
+AG2_SUMMARIES_DB = AG2_HOME / '.gemini' / 'antigravity' / 'conversation_summaries.db'
+AG2_ANNOTATIONS_DIR = AG2_HOME / '.gemini' / 'antigravity' / 'annotations'
+AG2_PROJECTS_CFG_DIR = AG2_HOME / '.gemini' / 'config' / 'projects'
 CLAUDE_PROJECTS_DIR = HOME / '.claude' / 'projects'
 CODEX_DIR = HOME / '.codex'
 CODEX_STATE_DB = CODEX_DIR / 'state_5.sqlite'
@@ -155,10 +161,28 @@ def strip_prompt_boilerplate(raw_text: str) -> tuple[str, bool, bool]:
 
     has_image = bool(_IMG_TAG_RE.search(s))
 
-    # Extract explicit Antigravity <USER_REQUEST> if present
+    # Extract explicit Antigravity <USER_REQUEST> if present (preserve artifact approval/comments when empty)
     m_req = _USER_REQ_RE.search(s)
     if m_req:
-        s = m_req.group(1).strip()
+        before_req = s[:m_req.start()].strip()
+        req_inner = m_req.group(1).strip()
+        if req_inner:
+            s = req_inner
+        elif before_req.lower().startswith('comments on artifact uri:'):
+            comment_lines = [
+                ln.strip()
+                for ln in before_req.splitlines()
+                if ln.strip() and not ln.strip().lower().startswith('comments on artifact uri:')
+            ]
+            non_approval = [ln for ln in comment_lines if ln.lower() != 'the user has approved this document.']
+            if non_approval:
+                s = '\n'.join(non_approval)
+            elif any(ln.lower() == 'the user has approved this document.' for ln in comment_lines):
+                s = '[Duyệt kế hoạch / Artifact]'
+            else:
+                s = ''
+        else:
+            s = ''
 
     # Auto system/cron/resume notifications
     if _AUTO_BOILERPLATE_RE.match(s):
@@ -184,7 +208,7 @@ def strip_prompt_boilerplate(raw_text: str) -> tuple[str, bool, bool]:
     # Ignore bare slash commands (/usage, /clear, /compact, /model, ...) unless paired with rich instruction
     first_line = s_clean.splitlines()[0].strip()
     if len(s_clean) < 60 and _SLASH_CMD_ONLY_RE.match(s_clean):
-        if first_line.split()[0].lower() not in ('/grill-me', '/plan', '/goal', '/boost', '/teamwork'):
+        if first_line.split()[0].lower() not in ('/grill-me', '/plan', '/goal', '/boost', '/teamwork', '/swarm'):
             return '', has_image, True
 
     return s_clean, has_image, False
@@ -217,19 +241,179 @@ def _classify_prompt(text: str) -> tuple[bool, bool, bool, bool]:
     return is_short, is_vague, is_corr, is_q_reply
 
 
-def compute_active_hours(timestamps: list[float], gap_s: float = 600.0, pad_s: float = 180.0) -> float:
-    """Tính số giờ thao tác thực (bỏ qua khoảng nghỉ dài > 10 phút, mỗi cụm tối thiểu ~3 phút)."""
-    if not timestamps:
-        return 0.0
-    ts_sorted = sorted(timestamps)
-    total_s = pad_s
-    for i in range(1, len(ts_sorted)):
-        delta = ts_sorted[i] - ts_sorted[i - 1]
-        if 0.0 <= delta <= gap_s:
-            total_s += delta
+def merge_time_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Hợp nhất các khoảng thời gian chồng lấn [start, end] để không cộng chồng phiên chạy song song."""
+    cleaned: list[tuple[float, float]] = []
+    for raw_s, raw_e in intervals:
+        s = float(raw_s or 0.0)
+        e = float(raw_e or 0.0)
+        if s <= 0.0 or e < s:
+            continue
+        cleaned.append((s, e))
+    if not cleaned:
+        return []
+    cleaned.sort(key=lambda x: (x[0], x[1]))
+    merged: list[tuple[float, float]] = [cleaned[0]]
+    for s, e in cleaned[1:]:
+        prev_s, prev_e = merged[-1]
+        if s <= prev_e:
+            if e > prev_e:
+                merged[-1] = (prev_s, e)
         else:
-            total_s += pad_s
+            merged.append((s, e))
+    return merged
+
+
+def intervals_total_hours(intervals: list[tuple[float, float]]) -> float:
+    merged = merge_time_intervals(intervals)
+    total_s = sum(max(0.0, e - s) for s, e in merged)
     return round(total_s / 3600.0, 3)
+
+
+def compute_active_intervals(
+    timestamps: list[float],
+    gap_s: float = 600.0,
+    pad_s: float = 180.0,
+    *,
+    is_sub: bool = False,
+    exact_spans: list[tuple[float, float]] | None = None,
+) -> list[tuple[float, float]]:
+    """Xây tập khoảng thời gian hoạt động đã hợp nhất (union).
+
+    - Với subagent/worker (`is_sub=True`): KHÔNG cộng đệm pad_s=180s cho từng phiên/prompt;
+      dùng khoảng chạy thực (`exact_spans`) hoặc khoảng liền mạch thực tế (`pad_s=0`) rồi union.
+    - Với phiên người dùng trực tiếp (`is_sub=False`): nối các prompt cách nhau <= gap_s
+      và chỉ thêm pad_s cho mỗi cụm liên tiếp.
+    """
+    if is_sub:
+        if exact_spans:
+            return merge_time_intervals(exact_spans)
+        if not timestamps:
+            return []
+        ts_sorted = sorted(float(t) for t in timestamps if float(t or 0.0) > 0.0)
+        if not ts_sorted:
+            return []
+        spans: list[tuple[float, float]] = []
+        seg_start = ts_sorted[0]
+        seg_end = ts_sorted[0]
+        for t in ts_sorted[1:]:
+            if 0.0 <= (t - seg_end) <= gap_s:
+                seg_end = t
+            else:
+                if seg_end > seg_start:
+                    spans.append((seg_start, seg_end))
+                seg_start = t
+                seg_end = t
+        if seg_end > seg_start:
+            spans.append((seg_start, seg_end))
+        return merge_time_intervals(spans)
+
+    if not timestamps:
+        return []
+    ts_sorted = sorted(float(t) for t in timestamps if float(t or 0.0) > 0.0)
+    if not ts_sorted:
+        return []
+    eff_pad = max(0.0, float(pad_s))
+    spans = []
+    seg_start = ts_sorted[0]
+    seg_end = ts_sorted[0]
+    for t in ts_sorted[1:]:
+        delta = t - seg_end
+        if 0.0 <= delta <= gap_s:
+            seg_end = t
+        else:
+            spans.append((seg_start, seg_end + eff_pad))
+            seg_start = t
+            seg_end = t
+    spans.append((seg_start, seg_end + eff_pad))
+    return merge_time_intervals(spans)
+
+
+def compute_active_hours(
+    timestamps: list[float],
+    gap_s: float = 600.0,
+    pad_s: float = 180.0,
+    *,
+    is_sub: bool = False,
+    exact_spans: list[tuple[float, float]] | None = None,
+) -> float:
+    """Tính số giờ thao tác thực từ union khoảng thời gian (không cộng chồng subagent)."""
+    intervals = compute_active_intervals(
+        timestamps,
+        gap_s=gap_s,
+        pad_s=pad_s,
+        is_sub=is_sub,
+        exact_spans=exact_spans,
+    )
+    return intervals_total_hours(intervals)
+
+
+def compute_union_active_hours_across_sessions(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Tính giờ hoạt động thực của người (direct) và worker (subagent) bằng union khoảng thời gian xuyên phiên song song.
+
+    Phiên thiếu `active_intervals` không được cộng gộp khoảng wall `start_ts..end_ts` vào giờ hoạt động thực;
+    phần ước lượng (fallback) được tách riêng vào `estimated_human_hours` / `estimated_worker_hours`.
+    """
+    human_all: list[tuple[float, float]] = []
+    worker_all: list[tuple[float, float]] = []
+    human_by_day: dict[str, list[tuple[float, float]]] = collections.defaultdict(list)
+    worker_by_day: dict[str, list[tuple[float, float]]] = collections.defaultdict(list)
+    est_human_all: list[tuple[float, float]] = []
+    est_worker_all: list[tuple[float, float]] = []
+    est_human_sessions = 0
+    est_worker_sessions = 0
+
+    for rec in sessions:
+        if not isinstance(rec, dict) or rec.get('is_fork_clone'):
+            continue
+        is_sub = bool(rec.get('is_sub'))
+        target_all = worker_all if is_sub else human_all
+        target_day = worker_by_day if is_sub else human_by_day
+        db_list = rec.get('day_breakdown')
+        found_any = False
+        if isinstance(db_list, list):
+            for db_item in db_list:
+                if not isinstance(db_item, dict):
+                    continue
+                dk = str(db_item.get('day') or '').strip()
+                ivs = db_item.get('active_intervals')
+                if isinstance(ivs, list) and ivs:
+                    for iv in ivs:
+                        if isinstance(iv, (list, tuple)) and len(iv) >= 2:
+                            pair = (float(iv[0] or 0.0), float(iv[1] or 0.0))
+                            if pair[0] > 0.0 and pair[1] >= pair[0]:
+                                target_all.append(pair)
+                                if dk:
+                                    target_day[dk].append(pair)
+                                found_any = True
+        if not found_any:
+            # Separate estimated fallback hours instead of polluting measured union active hours with wall spans
+            st = float(rec.get('start_ts') or 0.0)
+            en = float(rec.get('end_ts') or st)
+            clean_h = float(rec.get('clean_active_hours') or 0.0)
+            est_span: tuple[float, float] | None = None
+            if st > 0.0 and clean_h > 0.0:
+                est_span = (st, st + clean_h * 3600.0)
+            elif st > 0.0 and en > st:
+                est_span = (st, en)
+            if est_span is not None:
+                if is_sub:
+                    est_worker_all.append(est_span)
+                    est_worker_sessions += 1
+                else:
+                    est_human_all.append(est_span)
+                    est_human_sessions += 1
+
+    return {
+        'formula_version': 'union-v2',
+        'human_active_hours': intervals_total_hours(human_all),
+        'worker_active_hours': intervals_total_hours(worker_all),
+        'estimated_human_hours': intervals_total_hours(est_human_all),
+        'estimated_worker_hours': intervals_total_hours(est_worker_all),
+        'estimated_sessions_count': est_human_sessions + est_worker_sessions,
+        'human_by_day': {dk: intervals_total_hours(ivs) for dk, ivs in sorted(human_by_day.items())},
+        'worker_by_day': {dk: intervals_total_hours(ivs) for dk, ivs in sorted(worker_by_day.items())},
+    }
 
 
 _CODE_FILE_EXTS = (
@@ -444,6 +628,10 @@ def build_session_record(
     avg_len = round(sum(lengths) / max(1, len(lengths)), 1) if lengths else 0.0
     first_preview = redact_sensitive_text(human_events[0]['text'], 220).replace('\n', ' ') if human_events else ''
 
+    effective_is_sub = bool(is_sub) or _is_automated_worker_session(
+        human_events[0]['text'] if human_events else title, n_human
+    )
+
     # Day breakdown in +07:00
     by_day: dict[str, dict[str, Any]] = {}
     for e in human_events:
@@ -451,12 +639,27 @@ def build_session_record(
         slot = by_day.setdefault(d, {
             'day': d,
             'ts_list': [],
+            'exact_spans': [],
             'human_prompts': 0,
             'short_nudges': 0,
             'vague_errors': 0,
             'corr_kw': 0,
         })
-        slot['ts_list'].append(e['ts'])
+        ev_ts = float(e['ts'])
+        is_inherited_ts = bool(e.get('ts_inherited') or e.get('ts_is_fallback'))
+        if not is_inherited_ts:
+            slot['ts_list'].append(ev_ts)
+        # Collect exact execution spans for subagent/worker sessions (no synthetic 180s padding)
+        ev_end = float(e.get('_end_step_ts') or 0.0)
+        if ev_end <= ev_ts and e.get('turn_duration_s') is not None:
+            try:
+                dur_val = float(e['turn_duration_s'])
+                if 0.0 < dur_val <= 14400.0:
+                    ev_end = ev_ts + dur_val
+            except Exception:
+                ev_end = 0.0
+        if ev_end > ev_ts and (ev_end - ev_ts) <= 14400.0:
+            slot['exact_spans'].append((ev_ts, ev_end))
         slot['human_prompts'] += 1
         if e['is_short_nudge']:
             slot['short_nudges'] += 1
@@ -467,23 +670,44 @@ def build_session_record(
 
     # Distribute n_auto_msgs onto end_day (or proportionally across days)
     day_breakdown = []
+    all_session_intervals: list[tuple[float, float]] = []
     days_sorted = sorted(by_day.keys()) or [start_day]
     for idx_d, d in enumerate(days_sorted):
-        sl = by_day.get(d) or {'ts_list': [start_ts], 'human_prompts': 0, 'short_nudges': 0, 'vague_errors': 0, 'corr_kw': 0}
+        sl = by_day.get(d) or {
+            'ts_list': [start_ts],
+            'exact_spans': [],
+            'human_prompts': 0,
+            'short_nudges': 0,
+            'vague_errors': 0,
+            'corr_kw': 0,
+        }
         share_auto = n_auto_msgs if idx_d == len(days_sorted) - 1 else 0
+        day_ts_list = sl['ts_list'] or ([e['ts'] for e in human_events if _vn_day_of(e['ts']) == d] if human_events else [])
+        day_ivs = compute_active_intervals(
+            day_ts_list,
+            is_sub=effective_is_sub,
+            exact_spans=sl.get('exact_spans') or None,
+        )
+        all_session_intervals.extend(day_ivs)
+        day_hours = intervals_total_hours(day_ivs)
         day_breakdown.append({
             'day': d,
             'human_prompts': sl['human_prompts'],
             'raw_msgs': sl['human_prompts'] + share_auto,
             'auto_msgs': share_auto,
-            'active_hours': compute_active_hours(sl['ts_list']),
+            'active_hours': day_hours,
+            'active_intervals': [[round(s, 1), round(e, 1)] for s, e in day_ivs],
             'short_nudges': sl['short_nudges'],
             'vague_errors': sl['vague_errors'],
             'corr_kw': sl['corr_kw'],
         })
 
-    clean_hours = round(sum(x['active_hours'] for x in day_breakdown), 3) if human_events else 0.0
-    wall_hours = round(max(0.0, (end_ts - start_ts) / 3600.0), 2)
+    clean_hours = intervals_total_hours(all_session_intervals) if human_events else 0.0
+    max_step_ts_for_wall = max((float(e.get('_end_step_ts') or 0.0) for e in human_events), default=0.0)
+    eff_wall_end = max(end_ts, max_step_ts_for_wall) if effective_is_sub else end_ts
+    wall_hours = round(max(0.0, (eff_wall_end - start_ts) / 3600.0), 2)
+    if effective_is_sub and wall_hours >= 0.0:
+        clean_hours = round(min(clean_hours, max(wall_hours, intervals_total_hours(all_session_intervals))), 3)
 
     # Historical nhip-v1 label enrichment if available
     corr_rate = None
@@ -599,9 +823,6 @@ def build_session_record(
         })
 
     clean_title = redact_sensitive_text(title or first_preview or session_id, 160).replace('\n', ' ').strip()
-    effective_is_sub = bool(is_sub) or _is_automated_worker_session(
-        human_events[0]['text'] if human_events else title, n_human
-    )
     eff_total_tools = max(int(total_tool_calls or 0), sum(int(e.get('tool_call_count') or 0) for e in human_events))
     eff_redir = int(redirection_count) if redirection_count is not None else n_corr
     max_step_ts = max((float(e.get('_end_step_ts') or 0.0) for e in human_events), default=0.0)
@@ -613,6 +834,7 @@ def build_session_record(
         'project': _norm_project_name(cwd, project),
         'cwd': redact_sensitive_text(cwd, 160),
         'is_sub': effective_is_sub,
+        'sender_origin': 'agent_dispatch' if effective_is_sub else 'human',
         'is_fork_clone': False,
         'start_ts': round(start_ts, 3),
         'end_ts': round(end_ts, 3),
@@ -626,6 +848,7 @@ def build_session_record(
         'n_auto_msgs': n_auto_msgs,
         'auto_breakdown': auto_breakdown or {},
         'clean_active_hours': clean_hours,
+        'worker_active_hours': clean_hours if effective_is_sub else 0.0,
         'wall_hours': wall_hours,
         'busy_hours': clean_hours,
         'n_short_nudges': n_short,
@@ -673,15 +896,42 @@ def _open_pc_cache() -> sqlite3.Connection:
         """
     )
     row = con.execute("SELECT value FROM cache_meta WHERE key = 'schema_v'").fetchone()
-    if not row or str(row[0] or '') != 'v4':
+    if not row or str(row[0] or '') != 'v6':
         con.execute('DELETE FROM file_cache')
-        con.execute("INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('schema_v', 'v4')")
+        con.execute("INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('schema_v', 'v6')")
     con.commit()
     return con
 
 
 def _load_nhip_labels() -> dict[str, dict[str, Any]]:
     return {}
+
+
+_FILE_CACHE_MEM: dict[tuple[str, str], dict[str, tuple[int, int, dict[str, Any] | None]]] = {}
+
+
+def _get_prefix_mem_cache(
+    cache_con: sqlite3.Connection,
+    prefix: str,
+    scope_key: str,
+    force_full: bool,
+) -> dict[str, tuple[int, int, dict[str, Any] | None]]:
+    """Keep parsed file_cache entries in memory per (scope_key, CACHE_DB_PATH) to avoid re-reading large SQLite blobs."""
+    mem_bucket = _FILE_CACHE_MEM.setdefault((prefix, f"{scope_key}|{CACHE_DB_PATH}"), {})
+    if force_full:
+        mem_bucket.clear()
+        return mem_bucket
+    if not mem_bucket:
+        for source_key, mtime_ns, size_bytes, rj in cache_con.execute(
+            "SELECT source_key, mtime_ns, size_bytes, record_json FROM file_cache WHERE source_key LIKE ?",
+            (prefix + '%',),
+        ).fetchall():
+            try:
+                parsed = None if rj == '{}' else json.loads(rj)
+            except Exception:
+                continue
+            mem_bucket[source_key] = (int(mtime_ns or 0), int(size_bytes or 0), parsed)
+    return mem_bucket
 
 
 def _load_legacy_jsonl_baseline(tool: str, nhip_labels: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:  # noqa: ARG001
@@ -696,13 +946,16 @@ def _extract_claude_live(
     if not CLAUDE_PROJECTS_DIR.is_dir():
         return {}
     out: dict[str, dict[str, Any]] = {}
-    cached_rows = {}
-    if not force_full:
-        for row in cache_con.execute("SELECT source_key, mtime_ns, size_bytes, record_json FROM file_cache WHERE source_key LIKE 'claude:%'").fetchall():
-            cached_rows[row[0]] = (row[1], row[2], row[3])
+    mem_map = _get_prefix_mem_cache(cache_con, 'claude:', str(CLAUDE_PROJECTS_DIR), force_full)
 
     updates: list[tuple[str, int, int, str]] = []
-    for fp in CLAUDE_PROJECTS_DIR.rglob('*.jsonl'):
+    claude_files = (
+        Path(root) / fname
+        for root, _dirs, files in os.walk(CLAUDE_PROJECTS_DIR)
+        for fname in files
+        if fname.endswith('.jsonl')
+    )
+    for fp in claude_files:
         try:
             st = fp.stat()
         except OSError:
@@ -711,12 +964,13 @@ def _extract_claude_live(
             continue
         sid = fp.stem
         ckey = f'claude:{fp}'
-        if not force_full and ckey in cached_rows:
-            cm, cs, rj = cached_rows[ckey]
-            if cm == st.st_mtime_ns and cs == st.st_size:
-                if rj != '{}':
-                    rec = json.loads(rj)
-                    out[sid] = rec
+        if not force_full:
+            mem_hit = mem_map.get(ckey)
+            if mem_hit and mem_hit[0] == st.st_mtime_ns and mem_hit[1] == st.st_size:
+                rec_m = mem_hit[2]
+                if rec_m is not None:
+                    if sid not in out or len(rec_m.get('prompts_sample') or []) >= len(out[sid].get('prompts_sample') or []):
+                        out[sid] = dict(rec_m)
                 continue
 
         is_sub = ('subagents' in str(fp).lower()) or sid.startswith('agent-')
@@ -922,9 +1176,11 @@ def _extract_claude_live(
         if rec:
             # Prefer full non-subagent if same sid somehow collides
             if sid not in out or len(rec.get('prompts_sample') or []) >= len(out[sid].get('prompts_sample') or []):
-                out[sid] = rec
+                out[sid] = dict(rec)
+            mem_map[ckey] = (st.st_mtime_ns, st.st_size, rec)
             updates.append((ckey, st.st_mtime_ns, st.st_size, json.dumps(rec, ensure_ascii=False)))
         else:
+            mem_map[ckey] = (st.st_mtime_ns, st.st_size, None)
             updates.append((ckey, st.st_mtime_ns, st.st_size, '{}'))
         if len(updates) >= 250:
             cache_con.executemany('INSERT OR REPLACE INTO file_cache (source_key, mtime_ns, size_bytes, record_json) VALUES (?, ?, ?, ?)', updates)
@@ -947,57 +1203,74 @@ def _load_ag_projects_cfg() -> dict[str, tuple[str, str]]:
     if _AG_PROJECTS_CACHE['data'] and (now - float(_AG_PROJECTS_CACHE['at'])) < 30.0:
         return _AG_PROJECTS_CACHE['data']
     out: dict[str, tuple[str, str]] = {}
-    if AG_PROJECTS_CFG_DIR.is_dir():
-        for p in AG_PROJECTS_CFG_DIR.glob('*.json'):
-            try:
-                d = json.loads(p.read_text(encoding='utf-8', errors='replace'))
-            except Exception:
-                continue
-            pid = str(d.get('id') or p.stem).strip()
-            pname = str(d.get('name') or pid).strip()
-            folder_path = ''
-            resources = (d.get('projectResources') or {}).get('resources') or []
-            if resources and isinstance(resources[0], dict):
-                r0 = resources[0]
-                f_uri = str(r0.get('folderUri') or (r0.get('gitFolder') or {}).get('folderUri') or '')
-                if f_uri.startswith('file:///'):
-                    folder_path = urllib.parse.unquote(f_uri[8:])
-                else:
-                    folder_path = f_uri
-            if pid:
-                out[pid] = (pname, folder_path)
+    for cfg_dir in (AG2_PROJECTS_CFG_DIR, AG_PROJECTS_CFG_DIR):
+        if cfg_dir.is_dir():
+            for p in cfg_dir.glob('*.json'):
+                try:
+                    d = json.loads(p.read_text(encoding='utf-8', errors='replace'))
+                except Exception:
+                    continue
+                pid = str(d.get('id') or p.stem).strip()
+                pname = str(d.get('name') or pid).strip()
+                folder_path = ''
+                resources = (d.get('projectResources') or {}).get('resources') or []
+                if resources and isinstance(resources[0], dict):
+                    r0 = resources[0]
+                    f_uri = str(r0.get('folderUri') or (r0.get('gitFolder') or {}).get('folderUri') or '')
+                    if f_uri.startswith('file:///'):
+                        folder_path = urllib.parse.unquote(f_uri[8:])
+                    else:
+                        folder_path = f_uri
+                if pid:
+                    out[pid] = (pname, folder_path)
     _AG_PROJECTS_CACHE['at'] = now
     _AG_PROJECTS_CACHE['data'] = out
     return out
 
 
+_AG_SUMMARIES_META_CACHE: dict[str, Any] = {'sig': None, 'at': 0.0, 'data': {}}
+
+
 def _load_ag_annotations_meta() -> dict[str, dict[str, Any]]:
-    """Đọc nhanh ~/.gemini/antigravity/annotations/*.pbtxt (có cache theo mtime từng file)."""
+    """Đọc nhanh ~/.gemini/antigravity/annotations/*.pbtxt (kèm acct2 AG2, có cache theo mtime từng file)."""
     now = time.time()
-    if _AG_ANNOT_CACHE['files'] and (now - float(_AG_ANNOT_CACHE['at'])) < 2.5:
+    ann_dirs = [d for d in (AG_ANNOTATIONS_DIR, AG2_ANNOTATIONS_DIR) if d.is_dir()]
+    dir_sig = tuple(str(d) for d in ann_dirs)
+    if _AG_ANNOT_CACHE.get('dirs') != dir_sig:
+        _AG_ANNOT_CACHE['files'].clear()
+        _AG_ANNOT_CACHE['dirs'] = dir_sig
+        _AG_ANNOT_CACHE['at'] = 0.0
+    if _AG_ANNOT_CACHE['files'] and (now - float(_AG_ANNOT_CACHE['at'])) < 12.0:
         return {k: v[1] for k, v in _AG_ANNOT_CACHE['files'].items()}
-    if not AG_ANNOTATIONS_DIR.is_dir():
+    if not ann_dirs:
         return {}
     cached_files: dict[str, tuple[int, dict[str, Any]]] = _AG_ANNOT_CACHE['files']
     seen: set[str] = set()
-    for p in AG_ANNOTATIONS_DIR.glob('*.pbtxt'):
-        cid = p.stem
-        seen.add(cid)
+    for a_dir in ann_dirs:
         try:
-            st_m = p.stat().st_mtime_ns
+            with os.scandir(a_dir) as it:
+                for entry in it:
+                    if not entry.name.endswith('.pbtxt') or not entry.is_file():
+                        continue
+                    cid = entry.name[:-6]
+                    seen.add(cid)
+                    try:
+                        st_m = entry.stat().st_mtime_ns
+                    except OSError:
+                        continue
+                    prev = cached_files.get(cid)
+                    if prev and prev[0] == st_m:
+                        continue
+                    try:
+                        txt = Path(entry.path).read_text(encoding='utf-8', errors='replace')
+                    except OSError:
+                        continue
+                    pinned = bool(re.search(r'pinned:\s*true', txt))
+                    m_title = re.search(r'title:\s*"((?:[^"\\]|\\.)*)"', txt)
+                    title = m_title.group(1).replace('\\"', '"').strip() if m_title else ''
+                    cached_files[cid] = (st_m, {'pinned': pinned, 'title': title})
         except OSError:
             continue
-        prev = cached_files.get(cid)
-        if prev and prev[0] == st_m:
-            continue
-        try:
-            txt = p.read_text(encoding='utf-8', errors='replace')
-        except OSError:
-            continue
-        pinned = bool(re.search(r'pinned:\s*true', txt))
-        m_title = re.search(r'title:\s*"((?:[^"\\]|\\.)*)"', txt)
-        title = m_title.group(1).replace('\\"', '"').strip() if m_title else ''
-        cached_files[cid] = (st_m, {'pinned': pinned, 'title': title})
     for stale_k in list(cached_files.keys()):
         if stale_k not in seen:
             cached_files.pop(stale_k, None)
@@ -1006,93 +1279,114 @@ def _load_ag_annotations_meta() -> dict[str, dict[str, Any]]:
 
 
 def _load_ag_summaries_meta() -> dict[str, dict[str, Any]]:
-    """Đọc trực tiếp ~/.gemini/antigravity/conversation_summaries.db + annotations + projects để đồng bộ 1:1 thứ tự realtime với Antigravity PC."""
-    if not AG_SUMMARIES_DB.is_file():
+    """Đọc trực tiếp conversation_summaries.db (AG1 + AG2 acct2) + annotations + projects để đồng bộ 1:1 thứ tự realtime với Antigravity PC."""
+    dbs = [p for p in (AG_SUMMARIES_DB, AG2_SUMMARIES_DB) if p.is_file()]
+    if not dbs:
         return {}
-    out: dict[str, dict[str, Any]] = {}
     now_ts = time.time()
+    sig_parts: list[Any] = []
+    for sdb_p in dbs:
+        for p in (sdb_p, Path(str(sdb_p) + '-wal')):
+            try:
+                st = p.stat()
+                sig_parts.append((str(p), st.st_mtime_ns, st.st_size))
+            except OSError:
+                sig_parts.append((str(p), 0, 0))
+    cur_sig = tuple(sig_parts)
+    if (
+        _AG_SUMMARIES_META_CACHE['sig'] == cur_sig
+        and _AG_SUMMARIES_META_CACHE['data']
+        and (now_ts - float(_AG_SUMMARIES_META_CACHE['at'])) < 12.0
+    ):
+        return _AG_SUMMARIES_META_CACHE['data']
+    out: dict[str, dict[str, Any]] = {}
     proj_cfg = _load_ag_projects_cfg()
     ann_map = _load_ag_annotations_meta()
-    try:
-        con = sqlite3.connect(f'file:{AG_SUMMARIES_DB.as_posix()}?mode=ro', uri=True, timeout=5.0)
+    for sdb_path in dbs:
         try:
-            cols = {str(r[1]) for r in con.execute('PRAGMA table_info(conversation_summaries)').fetchall()}
-            has_rt = {'last_modified_time', 'status', 'not_fully_idle', 'killed', 'project_id'}.issubset(cols)
-            if has_rt:
-                rows = con.execute(
-                    """
-                    SELECT conversation_id, title, workspace_uris, parent_conversation_id,
-                           nesting_depth, agent_name, last_modified_time, status,
-                           not_fully_idle, killed, project_id
-                    FROM conversation_summaries
-                    """
-                ).fetchall()
-            else:
-                rows = [
-                    (*r, '', '', 0, 0, '')
-                    for r in con.execute(
+            con = sqlite3.connect(f'file:{sdb_path.as_posix()}?mode=ro', uri=True, timeout=5.0)
+            try:
+                cols = {str(r[1]) for r in con.execute('PRAGMA table_info(conversation_summaries)').fetchall()}
+                has_rt = {'last_modified_time', 'status', 'not_fully_idle', 'killed', 'project_id'}.issubset(cols)
+                if has_rt:
+                    rows = con.execute(
                         """
-                        SELECT conversation_id, title, workspace_uris, parent_conversation_id, nesting_depth, agent_name
+                        SELECT conversation_id, title, workspace_uris, parent_conversation_id,
+                               nesting_depth, agent_name, last_modified_time, status,
+                               not_fully_idle, killed, project_id
                         FROM conversation_summaries
                         """
                     ).fetchall()
-                ]
-        finally:
-            con.close()
-        for (
-            cid, title, ws_json, parent_cid, depth, agent_name,
-            last_mod_str, status_raw, not_fully_idle, killed_raw, project_id_raw
-        ) in rows:
-            cid_s = str(cid or '').strip()
-            if not cid_s:
-                continue
-            cwd_s = ''
-            if ws_json:
-                try:
-                    uris = json.loads(ws_json)
-                    if isinstance(uris, list) and uris:
-                        u0 = str(uris[0] or '')
-                        if u0.startswith('file:///'):
-                            cwd_s = urllib.parse.unquote(u0[8:])
-                        else:
-                            cwd_s = u0
-                except Exception:
-                    pass
-            pid_s = str(project_id_raw or '').strip()
-            proj_name = ''
-            if pid_s and pid_s in proj_cfg:
-                proj_name, cfg_folder = proj_cfg[pid_s]
-                if not cwd_s and cfg_folder:
-                    cwd_s = cfg_folder
-            if not proj_name:
-                proj_name = _norm_project_name(cwd_s, '')
-            ag_name = str(agent_name or '').strip().lower()
-            is_sub = bool(str(parent_cid or '').strip()) or int(depth or 0) > 0 or ag_name in (
-                'browser', 'research', 'self', 'image-generator', 'worker'
-            )
-            ann = ann_map.get(cid_s) or {}
-            clean_sm_title = str(ann.get('title') or title or '').strip()
-            if clean_sm_title.lower().startswith('the prompt could not be submitted'):
-                clean_sm_title = ''
-            mod_ts = _parse_iso_ts(last_mod_str) or 0.0
-            st_str = str(status_raw or 'CASCADE_RUN_STATUS_IDLE')
-            is_running = (
-                ('RUNNING' in st_str and (now_ts - mod_ts) < 900.0)
-                or (bool(int(not_fully_idle or 0)) and (now_ts - mod_ts) < 45.0)
-            )
-            out[cid_s] = {
-                'title': clean_sm_title,
-                'cwd': cwd_s,
-                'project': proj_name,
-                'is_sub': is_sub,
-                'last_modified_ts': mod_ts,
-                'status': st_str,
-                'is_running': is_running,
-                'is_pinned': bool(ann.get('pinned')),
-                'is_killed': bool(int(killed_raw or 0)),
-            }
-    except Exception:
-        pass
+                else:
+                    rows = [
+                        (*r, '', '', 0, 0, '')
+                        for r in con.execute(
+                            """
+                            SELECT conversation_id, title, workspace_uris, parent_conversation_id, nesting_depth, agent_name
+                            FROM conversation_summaries
+                            """
+                        ).fetchall()
+                    ]
+            finally:
+                con.close()
+            for (
+                cid, title, ws_json, parent_cid, depth, agent_name,
+                last_mod_str, status_raw, not_fully_idle, killed_raw, project_id_raw
+            ) in rows:
+                cid_s = str(cid or '').strip()
+                if not cid_s:
+                    continue
+                cwd_s = ''
+                if ws_json:
+                    try:
+                        uris = json.loads(ws_json)
+                        if isinstance(uris, list) and uris:
+                            u0 = str(uris[0] or '')
+                            if u0.startswith('file:///'):
+                                cwd_s = urllib.parse.unquote(u0[8:])
+                            else:
+                                cwd_s = u0
+                    except Exception:
+                        pass
+                pid_s = str(project_id_raw or '').strip()
+                proj_name = ''
+                if pid_s and pid_s in proj_cfg:
+                    proj_name, cfg_folder = proj_cfg[pid_s]
+                    if not cwd_s and cfg_folder:
+                        cwd_s = cfg_folder
+                if not proj_name:
+                    proj_name = _norm_project_name(cwd_s, '')
+                ag_name = str(agent_name or '').strip().lower()
+                is_sub = bool(str(parent_cid or '').strip()) or int(depth or 0) > 0 or ag_name in (
+                    'browser', 'research', 'self', 'image-generator', 'worker'
+                )
+                ann = ann_map.get(cid_s) or {}
+                clean_sm_title = str(ann.get('title') or title or '').strip()
+                if clean_sm_title.lower().startswith('the prompt could not be submitted'):
+                    clean_sm_title = ''
+                mod_ts = _parse_iso_ts(last_mod_str) or 0.0
+                st_str = str(status_raw or 'CASCADE_RUN_STATUS_IDLE')
+                is_running = (
+                    ('RUNNING' in st_str and (now_ts - mod_ts) < 900.0)
+                    or (bool(int(not_fully_idle or 0)) and (now_ts - mod_ts) < 45.0)
+                )
+                rec_sm = {
+                    'title': clean_sm_title,
+                    'cwd': cwd_s,
+                    'project': proj_name,
+                    'is_sub': is_sub,
+                    'last_modified_ts': mod_ts,
+                    'status': st_str,
+                    'is_running': is_running,
+                    'is_pinned': bool(ann.get('pinned')),
+                    'is_killed': bool(int(killed_raw or 0)),
+                }
+                prev_sm = out.get(cid_s)
+                if prev_sm is None or (bool(is_running), mod_ts) > (bool(prev_sm.get('is_running')), float(prev_sm.get('last_modified_ts') or 0.0)):
+                    out[cid_s] = rec_sm
+        except Exception:
+            pass
+    _AG_SUMMARIES_META_CACHE.update({'sig': cur_sig, 'at': now_ts, 'data': out})
     return out
 
 
@@ -1102,13 +1396,11 @@ def _extract_ag_live(
     ph_ag: dict[str, dict[str, Any]],
     nhip_labels: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    if not AG_BRAIN_DIR.is_dir():
+    brain_dirs = [d for d in (AG_BRAIN_DIR, AG2_BRAIN_DIR) if d.is_dir()]
+    if not brain_dirs:
         return {}
     out: dict[str, dict[str, Any]] = {}
-    cached_rows = {}
-    if not force_full:
-        for row in cache_con.execute("SELECT source_key, mtime_ns, size_bytes, record_json FROM file_cache WHERE source_key LIKE 'ag:%'").fetchall():
-            cached_rows[row[0]] = (row[1], row[2], row[3])
+    mem_map = _get_prefix_mem_cache(cache_con, 'ag:', f"{AG_BRAIN_DIR}|{AG2_BRAIN_DIR}", force_full)
 
     live_summaries = _load_ag_summaries_meta()
     sub_child_ids: set[str] = (
@@ -1117,7 +1409,19 @@ def _extract_ag_live(
     )
     conv_id_re = re.compile(r'conversationId["\':\s]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I)
 
-    t_files = list(AG_BRAIN_DIR.glob('*/.system_generated/logs/transcript.jsonl'))
+    best_tfiles: dict[str, tuple[tuple[int, int], Path]] = {}
+    for bd in brain_dirs:
+        for tf in bd.glob('*/.system_generated/logs/transcript.jsonl'):
+            cid_t = tf.parent.parent.parent.name
+            try:
+                tst = tf.stat()
+                sig_t = (int(tst.st_size), int(tst.st_mtime_ns))
+            except OSError:
+                continue
+            prev_t = best_tfiles.get(cid_t)
+            if prev_t is None or sig_t > prev_t[0]:
+                best_tfiles[cid_t] = (sig_t, tf)
+    t_files = [item[1] for item in best_tfiles.values()]
     tf_mtimes: dict[str, float] = {}
     now_ts = time.time()
     # First pass / cache read
@@ -1130,17 +1434,18 @@ def _extract_ag_live(
         cid = tf.parent.parent.parent.name
         tf_mtimes[cid] = float(st.st_mtime)
         ckey = f'ag:{cid}'
-        if not force_full and ckey in cached_rows:
-            cm, cs, rj = cached_rows[ckey]
+        if not force_full and ckey in mem_map:
+            cm, cs, rec_m = mem_map[ckey]
             if cm == st.st_mtime_ns and cs == st.st_size:
-                if rj != '{}':
-                    rec = json.loads(rj)
-                    out[cid] = rec
-                    if rec.get('_spawned_subs'):
-                        sub_child_ids.update(rec['_spawned_subs'])
+                if rec_m is not None:
+                    out[cid] = dict(rec_m)
+                    if rec_m.get('_spawned_subs'):
+                        sub_child_ids.update(rec_m['_spawned_subs'])
                 continue
 
         human_events: list[dict[str, Any]] = []
+        seen_queued_prompts: set[tuple[int, str]] = set()
+        step_idx_pos: dict[int, int] = {}
         n_raw = 0
         n_auto = 0
         auto_bd: dict[str, int] = collections.Counter()
@@ -1289,11 +1594,23 @@ def _extract_ag_live(
                         n_auto += 1
                         auto_bd['boilerplate'] += 1
                         continue
+                    dedup_key = (int(round(ts)), ' '.join(clean_t.split()))
+                    if dedup_key in seen_queued_prompts:
+                        n_auto += 1
+                        auto_bd['queued_dup'] += 1
+                        continue
+                    seen_queued_prompts.add(dedup_key)
                     sn, ve, ck, qr = _classify_prompt(clean_t)
                     cur_consec_tools = 0
                     pending_tcs = []
                     gen_idx = 0
-                    human_events.append({
+                    raw_si = obj.get('step_index')
+                    si_int: int | None = None
+                    if isinstance(raw_si, int) and not isinstance(raw_si, bool) and raw_si >= 0:
+                        si_int = raw_si
+                    elif isinstance(raw_si, str) and raw_si.isdigit():
+                        si_int = int(raw_si)
+                    ev_rec = {
                         'ts': ts,
                         'text': clean_t,
                         'has_image': has_media,
@@ -1301,8 +1618,27 @@ def _extract_ag_live(
                         'is_vague_error': ve,
                         'is_corr_kw': ck,
                         'is_question_reply': qr,
-                        'prompt_id': f'ag:{cid}:{obj.get("step_index", len(human_events))}',
-                    })
+                        'prompt_id': f'ag:{cid}:{si_int if si_int is not None else len(human_events)}',
+                    }
+                    if si_int is not None and si_int in step_idx_pos:
+                        # Antigravity transcript.jsonl appends a new USER_INPUT row with the same step_index
+                        # when the user edits or resends a turn; keep the latest version to match conversations/<cid>.db.
+                        old_pos = step_idx_pos[si_int]
+                        n_auto += 1
+                        auto_bd['edit_superseded'] += 1
+                        if old_pos == len(human_events) - 1:
+                            human_events[old_pos] = ev_rec
+                        else:
+                            human_events.pop(old_pos)
+                            for k_si, v_pos in list(step_idx_pos.items()):
+                                if v_pos > old_pos:
+                                    step_idx_pos[k_si] = v_pos - 1
+                            step_idx_pos[si_int] = len(human_events)
+                            human_events.append(ev_rec)
+                    else:
+                        if si_int is not None:
+                            step_idx_pos[si_int] = len(human_events)
+                        human_events.append(ev_rec)
         except Exception:
             continue
 
@@ -1333,9 +1669,11 @@ def _extract_ag_live(
         if rec:
             if spawned:
                 rec['_spawned_subs'] = spawned
+            mem_map[ckey] = (st.st_mtime_ns, st.st_size, dict(rec))
             out[cid] = rec
             updates.append((ckey, st.st_mtime_ns, st.st_size, json.dumps(rec, ensure_ascii=False)))
         else:
+            mem_map[ckey] = (st.st_mtime_ns, st.st_size, None)
             updates.append((ckey, st.st_mtime_ns, st.st_size, '{}'))
 
     # Apply sub_child_ids & live conversation_summaries.db titles/projects/running/last_modified_time across all files (including cached ones)
@@ -1416,10 +1754,7 @@ def _extract_codex_sqlite(cache_con: sqlite3.Connection, force_full: bool) -> di
         except Exception:
             pass
 
-    cached_rows = {}
-    if not force_full:
-        for row in cache_con.execute("SELECT source_key, mtime_ns, size_bytes, record_json FROM file_cache WHERE source_key LIKE 'codex:%'").fetchall():
-            cached_rows[row[0]] = (row[1], row[2], row[3])
+    mem_map = _get_prefix_mem_cache(cache_con, 'codex:', f"{CODEX_STATE_DB}|{CODEX_HISTORY_DB}", force_full)
 
     out: dict[str, dict[str, Any]] = {}
     updates: list[tuple[str, int, int, str]] = []
@@ -1450,11 +1785,11 @@ def _extract_codex_sqlite(cache_con: sqlite3.Connection, force_full: bool) -> di
             first_msg_db = str(row[9] or '')
 
             ckey = f'codex:{tid}'
-            if not force_full and ckey in cached_rows:
-                cm, _, rj = cached_rows[ckey]
+            if not force_full and ckey in mem_map:
+                cm, _, rec_m = mem_map[ckey]
                 if cm == upd_ms:
-                    if rj != '{}':
-                        out[tid] = json.loads(rj)
+                    if rec_m is not None:
+                        out[tid] = dict(rec_m)
                     continue
 
             is_sub = (
@@ -1697,9 +2032,11 @@ def _extract_codex_sqlite(cache_con: sqlite3.Connection, force_full: bool) -> di
                 last_activity_ts=last_act_ts,
             )
             if rec:
+                mem_map[ckey] = (upd_ms, 0, dict(rec))
                 out[tid] = rec
                 updates.append((ckey, upd_ms, 0, json.dumps(rec, ensure_ascii=False)))
             else:
+                mem_map[ckey] = (upd_ms, 0, None)
                 updates.append((ckey, upd_ms, 0, '{}'))
     finally:
         st5_con.close()
@@ -1863,6 +2200,7 @@ def sync_once(
                 by_sub['direct'] += 1
                 total_direct_p += int(r.get('n_human_prompts') or 0)
 
+        union_hours = compute_union_active_hours_across_sessions(records)
         summary = {
             'ok': True,
             'skipped': False,
@@ -1872,6 +2210,12 @@ def sync_once(
             'bg_sessions': by_sub['bg'],
             'direct_prompts': total_direct_p,
             'bg_prompts': total_bg_p,
+            'human_active_hours': union_hours['human_active_hours'],
+            'worker_active_hours': union_hours['worker_active_hours'],
+            'estimated_human_hours': union_hours['estimated_human_hours'],
+            'estimated_worker_hours': union_hours['estimated_worker_hours'],
+            'estimated_sessions_count': union_hours['estimated_sessions_count'],
+            'active_hours_formula_version': union_hours['formula_version'],
             'by_tool': dict(by_tool),
         }
 

@@ -34,6 +34,8 @@ import {
 } from 'lucide-react';
 import { showToast } from '../common/ToastContainer';
 import { copyToClipboard } from '../../utils/clipboard';
+import HighlightText from '../../utils/HighlightText';
+import { matchesAllVnTokens, scoreVnSearchFields, tokenizeVnSearch } from '../../utils/vnSearch';
 import type { PortalTab } from './MemberPortalHelpers';
 import { AntigravityPcCoachTab } from './AntigravityPcCoachTab';
 import {
@@ -199,6 +201,11 @@ interface CoachSessionSummary {
     scored_prompts_preview?: ScoredPromptPreviewItem[];
     top_prompt_lesson?: string;
     focus_habit?: FocusHabitItem;
+    matched_in?: string;
+    matched_turn_idx?: number | null;
+    match_count?: number;
+    matched_snippet?: string;
+    match_score?: number;
 }
 
 interface PromptSampleItem {
@@ -794,6 +801,10 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
 
     // Session filters, sorting & inspector modal
     const [sessionQuery, setSessionQuery] = useState<string>('');
+    const [sessionSearchScope, setSessionSearchScope] = useState<'all' | 'period'>('all');
+    const [sessionServerItems, setSessionServerItems] = useState<CoachSessionSummary[]>([]);
+    const [sessionServerTotal, setSessionServerTotal] = useState<number>(0);
+    const [sessionServerLoading, setSessionServerLoading] = useState<boolean>(false);
     const [severityFilter, setSeverityFilter] = useState<'all' | 'red' | 'amber' | 'green'>('all');
     const [flagFilter, setFlagFilter] = useState<string>('all');
     const [kpiFilter, setKpiFilter] = useState<KpiFilterKey>('all');
@@ -871,6 +882,7 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
     const [dayModalLoading, setDayModalLoading] = useState<boolean>(false);
     const [dayModalTool, setDayModalTool] = useState<string>('all');
     const [dayModalSubTab, setDayModalSubTab] = useState<'direct' | 'bg' | 'all'>('direct');
+    const [dayModalSearch, setDayModalSearch] = useState<string>('');
     const [expandedDaySessKey, setExpandedDaySessKey] = useState<string | null>(null);
 
     // Realtime auto-refresh state
@@ -997,6 +1009,7 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                 setDayModalLoading(true);
                 setDayModalTool('all');
                 setDayModalSubTab('direct');
+                setDayModalSearch('');
                 setExpandedDaySessKey(null);
             }
             try {
@@ -1860,14 +1873,87 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
         auto_analyze_ai: true,
     };
 
+    useEffect(() => {
+        const applyHandoff = (qStr: string, openPc = false) => {
+            if (!qStr) return;
+            setSessionQuery(qStr);
+            setSubView(openPc ? 'ag_pc' : 'sessions');
+        };
+        try {
+            const raw = sessionStorage.getItem('aihot_conv_handoff');
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed?.target === 'a12' || parsed?.target === 'a12_pc') {
+                    sessionStorage.removeItem('aihot_conv_handoff');
+                    applyHandoff(String(parsed.query || ''), parsed.target === 'a12_pc');
+                }
+            }
+        } catch {
+            // ignore storage errors
+        }
+        const onHandoff = (ev: Event) => {
+            const det = (ev as CustomEvent)?.detail;
+            if (det && (det.target === 'a12' || det.target === 'a12_pc')) {
+                applyHandoff(String(det.query || ''), det.target === 'a12_pc');
+            }
+        };
+        window.addEventListener('aihot-conv-search-handoff', onHandoff);
+        return () => window.removeEventListener('aihot-conv-search-handoff', onHandoff);
+    }, []);
+
+    useEffect(() => {
+        const qTrim = sessionQuery.trim();
+        if (qTrim.length < 2) {
+            setSessionServerItems([]);
+            setSessionServerTotal(0);
+            setSessionServerLoading(false);
+            return;
+        }
+        const ac = new AbortController();
+        setSessionServerLoading(true);
+        const tm = window.setTimeout(async () => {
+            try {
+                const params = new URLSearchParams({
+                    q: qTrim,
+                    period: sessionSearchScope === 'all' ? 'all' : period,
+                    tool: toolFilter,
+                    include_sub: includeSub ? '1' : '0',
+                    severity: severityFilter,
+                    limit: '80',
+                });
+                if (sessionSearchScope === 'period' && period === 'date' && customDate) {
+                    params.set('date', customDate);
+                }
+                const res = await fetch(`/api/owner/prompt-coach/search?${params.toString()}`, {
+                    headers: resolveAuthHeaders(),
+                    credentials: 'same-origin',
+                    signal: ac.signal,
+                });
+                const doc = await res.json().catch(() => null);
+                if (!ac.signal.aborted && res.ok && doc?.ok && Array.isArray(doc.items)) {
+                    setSessionServerItems(doc.items as CoachSessionSummary[]);
+                    setSessionServerTotal(Number(doc.total_hits ?? doc.items.length));
+                }
+            } catch {
+                // ignore abort/network error
+            } finally {
+                if (!ac.signal.aborted) setSessionServerLoading(false);
+            }
+        }, 240);
+        return () => {
+            ac.abort();
+            window.clearTimeout(tm);
+        };
+    }, [sessionQuery, sessionSearchScope, period, customDate, toolFilter, includeSub, severityFilter, resolveAuthHeaders]);
+
     const filteredSessions = useMemo(() => {
         const list = dash?.sessions || [];
-        const q = sessionQuery.trim().toLowerCase();
+        const qTokens = tokenizeVnSearch(sessionQuery);
         const maxP = settings.max_prompts_per_session || 12;
         const maxH = settings.max_hours_per_session || 2.0;
         const sevRank: Record<string, number> = { red: 3, amber: 2, green: 1 };
 
-        const matched = list.filter(s => {
+        const passesFilters = (s: CoachSessionSummary): boolean => {
             if (severityFilter !== 'all' && s.severity !== severityFilter) return false;
             if (flagFilter !== 'all' && !(s.flags || []).some(f => f.code === flagFilter)) return false;
             if (kpiFilter === 'over_limit') {
@@ -1875,42 +1961,91 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
             } else if (kpiFilter === 'savable') {
                 if (!(s.n_human_prompts > maxP)) return false;
             }
-            if (!q) return true;
-            const hay = `${s.title} ${s.project} ${s.first_human_preview} ${s.session_key}`.toLowerCase();
-            return hay.includes(q);
+            return true;
+        };
+
+        if (qTokens.length === 0) {
+            const matched = list.filter(passesFilters);
+            return [...matched].sort((a, b) => {
+                if (sortBy === 'period_prompts') {
+                    const pa = a.period_human_prompts ?? a.day_human_prompts ?? a.n_human_prompts;
+                    const pb = b.period_human_prompts ?? b.day_human_prompts ?? b.n_human_prompts;
+                    if (pb !== pa) return pb - pa;
+                    return (b.end_ts || 0) - (a.end_ts || 0);
+                }
+                if (sortBy === 'recent') {
+                    const runDiff = Number(Boolean(b.is_running)) - Number(Boolean(a.is_running));
+                    if (runDiff !== 0) return runDiff;
+                    return Math.max(b.last_activity_ts || 0, b.end_ts || 0) - Math.max(a.last_activity_ts || 0, a.end_ts || 0);
+                }
+                if (sortBy === 'total_prompts') {
+                    if (b.n_human_prompts !== a.n_human_prompts) return b.n_human_prompts - a.n_human_prompts;
+                    return (b.clean_active_hours || 0) - (a.clean_active_hours || 0);
+                }
+                if (sortBy === 'hours_waste') {
+                    const wa = (a.clean_active_hours || 0) + ((a.n_short_nudges || 0) + (a.n_vague_errors || 0) + (a.n_corr_kw || 0)) * 0.15;
+                    const wb = (b.clean_active_hours || 0) + ((b.n_short_nudges || 0) + (b.n_vague_errors || 0) + (b.n_corr_kw || 0)) * 0.15;
+                    if (wb !== wa) return wb - wa;
+                    return b.n_human_prompts - a.n_human_prompts;
+                }
+                const ra = sevRank[a.severity] || 0;
+                const rb = sevRank[b.severity] || 0;
+                if (rb !== ra) return rb - ra;
+                if (a.rule_score !== b.rule_score) return a.rule_score - b.rule_score;
+                return b.n_human_prompts - a.n_human_prompts;
+            });
+        }
+
+        const srvMap = new Map<string, CoachSessionSummary>();
+        sessionServerItems.forEach(it => srvMap.set(it.session_key, it));
+        const merged = new Map<string, { item: CoachSessionSummary; rank: number }>();
+
+        list.forEach(s => {
+            if (!passesFilters(s)) return;
+            const srv = srvMap.get(s.session_key);
+            const localScore = scoreVnSearchFields(
+                {
+                    title: s.title,
+                    project: `${s.project} ${s.session_key}`,
+                    preview: s.first_human_preview,
+                    body: `${s.ai_summary || ''} ${s.ai_takeaway || ''} ${s.top_prompt_lesson || ''}`,
+                },
+                qTokens
+            );
+            if (localScore > 0 || srv) {
+                const enriched: CoachSessionSummary = srv
+                    ? {
+                          ...s,
+                          matched_in: srv.matched_in,
+                          matched_turn_idx: srv.matched_turn_idx,
+                          match_count: srv.match_count,
+                          matched_snippet: srv.matched_snippet,
+                          match_score: srv.match_score,
+                      }
+                    : s;
+                merged.set(s.session_key, {
+                    item: enriched,
+                    rank: Math.max(localScore, Number(srv?.match_score || 0)),
+                });
+            }
         });
 
-        return [...matched].sort((a, b) => {
-            if (sortBy === 'period_prompts') {
-                const pa = a.period_human_prompts ?? a.day_human_prompts ?? a.n_human_prompts;
-                const pb = b.period_human_prompts ?? b.day_human_prompts ?? b.n_human_prompts;
-                if (pb !== pa) return pb - pa;
-                return (b.end_ts || 0) - (a.end_ts || 0);
+        sessionServerItems.forEach(srv => {
+            if (!passesFilters(srv)) return;
+            if (!merged.has(srv.session_key)) {
+                merged.set(srv.session_key, { item: srv, rank: Number(srv.match_score || 50) });
             }
-            if (sortBy === 'recent') {
-                const runDiff = Number(Boolean(b.is_running)) - Number(Boolean(a.is_running));
-                if (runDiff !== 0) return runDiff;
-                return Math.max(b.last_activity_ts || 0, b.end_ts || 0) - Math.max(a.last_activity_ts || 0, a.end_ts || 0);
-            }
-            if (sortBy === 'total_prompts') {
-                if (b.n_human_prompts !== a.n_human_prompts) return b.n_human_prompts - a.n_human_prompts;
-                return (b.clean_active_hours || 0) - (a.clean_active_hours || 0);
-            }
-            if (sortBy === 'hours_waste') {
-                const wa = (a.clean_active_hours || 0) + ((a.n_short_nudges || 0) + (a.n_vague_errors || 0) + (a.n_corr_kw || 0)) * 0.15;
-                const wb = (b.clean_active_hours || 0) + ((b.n_short_nudges || 0) + (b.n_vague_errors || 0) + (b.n_corr_kw || 0)) * 0.15;
-                if (wb !== wa) return wb - wa;
-                return b.n_human_prompts - a.n_human_prompts;
-            }
-            // 'priority': severity desc -> (100 - score) desc -> n_human_prompts desc
-            const ra = sevRank[a.severity] || 0;
-            const rb = sevRank[b.severity] || 0;
-            if (rb !== ra) return rb - ra;
-            if (a.rule_score !== b.rule_score) return a.rule_score - b.rule_score;
-            return b.n_human_prompts - a.n_human_prompts;
         });
+
+        return Array.from(merged.values())
+            .sort((a, b) => {
+                if (b.rank !== a.rank) return b.rank - a.rank;
+                return Math.max(b.item.last_activity_ts || 0, b.item.end_ts || 0) - Math.max(a.item.last_activity_ts || 0, a.item.end_ts || 0);
+            })
+            .map(x => x.item);
     }, [
         dash?.sessions,
+        sessionServerItems,
         sessionQuery,
         severityFilter,
         flagFilter,
@@ -1922,10 +2057,10 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
 
     const filteredLibrary = useMemo(() => {
         const list = dash?.saved_prompts || [];
-        const q = libSearch.trim().toLowerCase();
-        if (!q) return list;
+        const qTokens = tokenizeVnSearch(libSearch);
+        if (qTokens.length === 0) return list;
         return list.filter(x =>
-            `${x.title} ${x.category} ${x.prompt_template} ${x.notes}`.toLowerCase().includes(q)
+            matchesAllVnTokens(`${x.title} ${x.category} ${x.prompt_template} ${x.notes}`, qTokens)
         );
     }, [dash?.saved_prompts, libSearch]);
 
@@ -3661,14 +3796,17 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                                                                 className="text-left text-indigo-700 dark:text-indigo-300 font-bold hover:underline line-clamp-2 break-words cursor-pointer"
                                                             >
                                                                 {row.project ? `[${row.project}] ` : ''}
-                                                                {formatCleanSessionTitle(row.session_title, row.text_redacted, row.session_key)}
+                                                                <HighlightText
+                                                                    text={formatCleanSessionTitle(row.session_title, row.text_redacted, row.session_key)}
+                                                                    query={tableSearch}
+                                                                />
                                                             </button>
                                                         </td>
 
                                                         {/* Col 2: Original Prompt */}
                                                         <td className="py-3 px-3 space-y-1.5 max-w-[300px]">
                                                             <div className="text-slate-900 dark:text-slate-100 font-medium whitespace-pre-wrap break-words line-clamp-4 leading-relaxed">
-                                                                {row.text_redacted}
+                                                                <HighlightText text={row.text_redacted} query={tableSearch} />
                                                             </div>
                                                             <div className="flex flex-wrap items-center gap-1">
                                                                 {row.has_image && (
@@ -3762,14 +3900,17 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                                                                 </div>
                                                             )}
                                                             <div className="text-slate-700 dark:text-slate-300 line-clamp-3 leading-relaxed">
-                                                                {row.lesson}
+                                                                <HighlightText text={row.lesson} query={tableSearch} />
                                                             </div>
                                                         </td>
 
                                                         {/* Col 5: Improved Prompt + Quick Actions */}
                                                         <td className="py-3 px-3 space-y-2 max-w-[340px]">
                                                             <div className="rounded-lg bg-emerald-50/90 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/70 p-2 text-emerald-950 dark:text-emerald-100 line-clamp-3 whitespace-pre-wrap break-words leading-relaxed">
-                                                                {row.improved_prompt || 'Prompt đã đạt chuẩn rõ ràng.'}
+                                                                <HighlightText
+                                                                    text={row.improved_prompt || 'Prompt đã đạt chuẩn rõ ràng.'}
+                                                                    query={tableSearch}
+                                                                />
                                                             </div>
                                                             <div
                                                                 onClick={e => e.stopPropagation()}
@@ -3972,16 +4113,41 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                     {renderSpotlightSection(true)}
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
                         <div className="relative flex-1">
-                            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                            <Search className={`w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 ${sessionServerLoading ? 'text-indigo-500 animate-pulse' : 'text-slate-400'}`} />
                             <input
                                 type="text"
                                 value={sessionQuery}
                                 onChange={e => setSessionQuery(e.target.value)}
-                                placeholder="Tìm hội thoại theo tiêu đề, dự án, nội dung mở đầu..."
-                                className="w-full pl-9 pr-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-900 dark:text-white"
+                                placeholder="Tìm không dấu theo tiêu đề, prompt bên trong, AI chẩn đoán, file..."
+                                className="w-full pl-9 pr-9 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-900 dark:text-white"
                             />
+                            {sessionQuery && (
+                                <button
+                                    type="button"
+                                    onClick={() => setSessionQuery('')}
+                                    aria-label="Xóa từ khóa tìm hội thoại"
+                                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+                                >
+                                    <X className="w-4 h-4" />
+                                </button>
+                            )}
                         </div>
                         <div className="flex flex-wrap items-center gap-1.5">
+                            {sessionQuery.trim().length > 0 && (
+                                <button
+                                    type="button"
+                                    onClick={() => setSessionSearchScope(s => (s === 'all' ? 'period' : 'all'))}
+                                    className={`px-2.5 py-1.5 rounded-lg border text-xs font-bold cursor-pointer tabular-nums ${
+                                        sessionSearchScope === 'all'
+                                            ? 'bg-indigo-100 dark:bg-indigo-950/70 text-indigo-800 dark:text-indigo-200 border-indigo-300 dark:border-indigo-700'
+                                            : 'bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700'
+                                    }`}
+                                >
+                                    {sessionSearchScope === 'all'
+                                        ? `Toàn lịch sử · ${filteredSessions.length}${sessionServerTotal > filteredSessions.length ? `/${sessionServerTotal}` : ''}`
+                                        : `Kỳ đang xem · ${filteredSessions.length}`}
+                                </button>
+                            )}
                             {kpiFilter !== 'all' && (
                                 <button
                                     type="button"
@@ -4142,8 +4308,27 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                                                     </span>
                                                 </div>
                                                 <h3 className="text-xs sm:text-sm font-extrabold text-slate-900 dark:text-white break-words">
-                                                    {cleanTitle}
+                                                    <HighlightText text={cleanTitle} query={sessionQuery} />
                                                 </h3>
+                                                {sessionQuery.trim().length > 0 && s.matched_snippet && (
+                                                    <div className="rounded-lg bg-indigo-50/70 dark:bg-indigo-950/35 border border-indigo-200/70 dark:border-indigo-800/60 px-2.5 py-1.5 text-xs text-slate-700 dark:text-slate-200 flex flex-wrap items-center justify-between gap-2">
+                                                        <span className="line-clamp-2 break-words flex-1 min-w-0">
+                                                            <HighlightText text={s.matched_snippet} query={sessionQuery} />
+                                                        </span>
+                                                        {s.matched_turn_idx && s.matched_turn_idx > 0 && (
+                                                            <button
+                                                                type="button"
+                                                                onClick={e => {
+                                                                    e.stopPropagation();
+                                                                    void openSessionInspector(s.session_key, false, false, 'all', s.matched_turn_idx ?? null);
+                                                                }}
+                                                                className="shrink-0 px-2 py-0.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-bold cursor-pointer tabular-nums"
+                                                            >
+                                                                Khớp Lượt #{s.matched_turn_idx} →
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                )}
                                             </div>
 
                                             <div className="flex flex-wrap sm:flex-nowrap items-center justify-end gap-2 shrink-0 tabular-nums">
@@ -5830,13 +6015,26 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                                                     {inspectDetail.prompts_sample.filter(p => (p.score ?? 0) >= 80).length}
                                                     )
                                                 </button>
-                                                <input
-                                                    type="text"
-                                                    value={promptSearch}
-                                                    onChange={e => setPromptSearch(e.target.value)}
-                                                    placeholder="Tìm trong prompt..."
-                                                    className="px-2.5 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs text-slate-900 dark:text-white"
-                                                />
+                                                <div className="relative flex items-center">
+                                                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 pointer-events-none" />
+                                                    <input
+                                                        type="text"
+                                                        value={promptSearch}
+                                                        onChange={e => setPromptSearch(e.target.value)}
+                                                        placeholder="Tìm không dấu trong prompt, bài học, file..."
+                                                        className="pl-8 pr-7 py-1 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs text-slate-900 dark:text-white"
+                                                    />
+                                                    {promptSearch && (
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => setPromptSearch('')}
+                                                            aria-label="Xóa tìm prompt"
+                                                            className="absolute right-2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+                                                        >
+                                                            <X className="w-3.5 h-3.5" />
+                                                        </button>
+                                                    )}
+                                                </div>
                                             </div>
                                         </div>
 
@@ -5866,7 +6064,10 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                                                     }
                                                     if (
                                                         promptSearch.trim() &&
-                                                        !smp.text_redacted.toLowerCase().includes(promptSearch.trim().toLowerCase())
+                                                        !matchesAllVnTokens(
+                                                            `${smp.text_redacted} ${smp.lesson || ''} ${smp.improved_prompt || ''} ${smp.assistant_summary || ''} ${(smp.files_touched || []).join(' ')}`,
+                                                            promptSearch
+                                                        )
                                                     ) {
                                                         return false;
                                                     }
@@ -6027,7 +6228,7 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                                                                         isExp ? '' : 'line-clamp-3'
                                                                     }`}
                                                                 >
-                                                                    {smp.text_redacted}
+                                                                    <HighlightText text={smp.text_redacted} query={promptSearch} />
                                                                 </div>
 
                                                                 {/* 7-Dimension Stage-aware Rubric Pills & HRPO Tool Trace */}
@@ -6570,6 +6771,26 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                                                 </button>
                                             )}
                                         </div>
+                                        <div className="relative flex items-center min-w-[210px] sm:min-w-[260px]">
+                                            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 pointer-events-none" />
+                                            <input
+                                                type="text"
+                                                value={dayModalSearch}
+                                                onChange={e => setDayModalSearch(e.target.value)}
+                                                placeholder="Tìm không dấu phiên trong ngày..."
+                                                className="w-full pl-8 pr-7 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs text-slate-900 dark:text-white"
+                                            />
+                                            {dayModalSearch && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setDayModalSearch('')}
+                                                    aria-label="Xóa tìm phiên trong ngày"
+                                                    className="absolute right-2 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+                                                >
+                                                    <X className="w-3.5 h-3.5" />
+                                                </button>
+                                            )}
+                                        </div>
                                     </div>
 
                                     {/* Day Sessions List */}
@@ -6579,6 +6800,15 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                                                 if (dayModalTool !== 'all' && s.tool !== dayModalTool) return false;
                                                 if (dayModalSubTab === 'direct' && s.is_sub) return false;
                                                 if (dayModalSubTab === 'bg' && !s.is_sub) return false;
+                                                if (
+                                                    dayModalSearch.trim() &&
+                                                    !matchesAllVnTokens(
+                                                        `${s.title} ${s.project} ${s.first_human_preview} ${s.ai_summary || ''}`,
+                                                        dayModalSearch
+                                                    )
+                                                ) {
+                                                    return false;
+                                                }
                                                 return true;
                                             })
                                             .map(s => {
@@ -6620,7 +6850,10 @@ export const AdminPromptCoachSection: React.FC<AdminPromptCoachSectionProps> = (
                                                                     )}
                                                                 </div>
                                                                 <div className="text-xs sm:text-sm font-extrabold text-slate-900 dark:text-white break-words">
-                                                                    {formatCleanSessionTitle(s.title, s.first_human_preview, s.session_key)}
+                                                                    <HighlightText
+                                                                        text={formatCleanSessionTitle(s.title, s.first_human_preview, s.session_key)}
+                                                                        query={dayModalSearch}
+                                                                    />
                                                                 </div>
                                                                 <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
                                                                     Trong ngày {dayModalDate}:{' '}

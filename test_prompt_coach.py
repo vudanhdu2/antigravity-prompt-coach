@@ -41,7 +41,7 @@ class TestSelfHostPromptCoach(unittest.TestCase):
     def test_01_zero_owner_or_secret_leaks_in_repo(self) -> None:
         forbidden = re.compile(r'(vuuyd|vps111|/var/lib/antigravity|ProjectHub|9router|gho_[A-Za-z0-9]{10,}|sk-proj-[A-Za-z0-9]{20,})', re.I)
         for fp in ROOT.rglob('*'):
-            if not fp.is_file() or '.git' in fp.parts or fp.name == 'test_prompt_coach.py':
+            if not fp.is_file() or any(part in ('.git', '__pycache__', 'node_modules') for part in fp.parts) or fp.name == 'test_prompt_coach.py':
                 continue
             if fp.suffix.lower() in ('.png', '.jpg', '.webp', '.woff', '.woff2', '.ico'):
                 continue
@@ -148,9 +148,25 @@ class TestSelfHostPromptCoach(unittest.TestCase):
                 self.assertTrue(dash['ok'])
                 self.assertEqual(len(dash['sessions']), 1)
                 self.assertTrue(dash['sessions'][0]['is_running'])
+
+            # 4. FTS5 Vietnamese search endpoint works with session token
+            req_search = urllib.request.Request(
+                f'http://127.0.0.1:{port}/api/owner/prompt-coach/search?q=prompt_coach_server',
+                headers={'Authorization': f'Bearer {tok}'},
+            )
+            with urllib.request.urlopen(req_search, timeout=5) as r_s:
+                s_data = json.loads(r_s.read().decode('utf-8'))
+                self.assertTrue(s_data.get('ok'))
+                self.assertGreaterEqual(len(s_data.get('results') or s_data.get('items') or s_data.get('sessions') or []), 1)
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+    def test_06_collector_imports_and_version_parity(self) -> None:
+        import coach_collector  # noqa: F401
+        self.assertEqual(self.srv_mod.VERSION, '1.2.0')
+        pkg = json.loads((ROOT / 'package.json').read_text(encoding='utf-8'))
+        self.assertEqual(pkg.get('version'), '1.2.0')
 
 
 if __name__ == '__main__':

@@ -4,7 +4,18 @@ Toàn bộ lịch sử phiên bản, ngày giờ phát hành (múi giờ Việt 
 
 ---
 
-## `v1.1.0` — Phát hành: `16/11/2026 14:21 (GMT+7)` · Commit `f974e2b`
+## `v1.2.0` — Phát hành: `27/11/2026 (GMT+7)`
+- **Tìm kiếm Tiếng Việt FTS5 & Nhảy thẳng tới đúng lượt trong phiên (`AdminPromptCoachSection.tsx`, `AntigravityPcCoachTab.tsx`, `coach_engine.py`)**:
+  - Hỗ trợ tìm kiếm toàn văn tiếng Việt (có dấu & không dấu) qua SQLite FTS5 trên toàn bộ tiêu đề phiên và nội dung prompt, kèm tính năng nhảy tức thì tới đúng lượt câu lệnh trong giao diện Song song Thật ↔ 1-Phát.
+- **Loại bỏ prompt cha bị fork & khử trùng lặp `step_index` khi sửa/rewind (`coach_collector.py`)**:
+  - Tự động lọc bỏ các prompt kế thừa từ phiên cha khi fork hội thoại trong Antigravity Desktop và chỉ giữ bản sửa mới nhất cho mỗi `step_index`, loại bỏ triệt để lỗi đếm trùng/chấm oan prompt.
+- **Tối ưu tốc độ thu thập & giảm tải I/O SQLite (`_get_prefix_mem_cache`)**:
+  - Giữ bản parse `file_cache` trong RAM theo khóa thư mục giúp Watcher Realtime 2.5s không còn phải đọc lặp hàng chục MB blob SQLite, đồng thời hỗ trợ tùy chọn hồ sơ Antigravity phụ qua biến môi trường `PROMPT_COACH_AG2_HOME`.
+- **Chuẩn hóa phiên bản `v1.2.0` trên `package.json`, `prompt_coach_server.py` & biên dịch mới toàn bộ gói `web/` build sẵn**.
+
+---
+
+## `v1.1.0` — Phát hành: `16/11/2026 14:21 (GMT+7)` · Commit `77540f5`
 - **Bổ sung Báo cáo Nhịp Realtime 30 Giây (`RealtimeExecutiveReportPanel.tsx` & `realtime_report` API)**:
   - Giúp nắm bắt toàn cảnh hiệu suất Prompt & Phiên trong 30 giây mà không cần đọc từng câu prompt:
     1. **Nhịp sống tức thời (`live_pulse`)**: Danh sách phiên đang chạy trực tiếp (`4 chấm`), nhịp 2 giờ gần nhất và nút **Copy Báo cáo Tóm tắt Markdown 1-Chạm**.

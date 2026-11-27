@@ -38,6 +38,8 @@ import {
     Zap,
 } from 'lucide-react';
 import { showToast } from '../common/ToastContainer';
+import HighlightText from '../../utils/HighlightText';
+import { matchesAllVnTokens, scoreVnSearchFields, tokenizeVnSearch } from '../../utils/vnSearch';
 import {
     RealtimeExecutiveReportPanel,
     type RealtimeExecutiveReport,
@@ -88,6 +90,11 @@ export interface AgPcSessionSummary {
     weak_prompt_count?: number;
     mergeable_count?: number;
     focus_habit?: AgPcFocusHabit;
+    matched_in?: string;
+    matched_turn_idx?: number | null;
+    match_count?: number;
+    matched_snippet?: string;
+    match_score?: number;
 }
 
 export interface AgPcPromptSample {
@@ -710,7 +717,17 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
     const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
     const [mobileDrawerOpen, setMobileDrawerOpen] = useState<boolean>(false);
     const [sidebarSearch, setSidebarSearch] = useState<string>('');
+    const [searchScope, setSearchScope] = useState<'all' | 'period'>('all');
+    const [serverSearchItems, setServerSearchItems] = useState<AgPcSessionSummary[]>([]);
+    const [serverSearchTotal, setServerSearchTotal] = useState<number>(0);
+    const [serverSearchLoading, setServerSearchLoading] = useState<boolean>(false);
     const [onlyErrSessions, setOnlyErrSessions] = useState<boolean>(false);
+    const [inSessionSearchOpen, setInSessionSearchOpen] = useState<boolean>(false);
+    const [inSessionQuery, setInSessionQuery] = useState<string>('');
+    const [inSessionOnlyMatches, setInSessionOnlyMatches] = useState<boolean>(false);
+    const [inSessionCursor, setInSessionCursor] = useState<number>(0);
+    const sidebarSearchInputRef = useRef<HTMLInputElement | null>(null);
+    const inSessionSearchInputRef = useRef<HTMLInputElement | null>(null);
 
     const [detail, setDetail] = useState<AgPcSessionDetail | null>(null);
     const [detailLoading, setDetailLoading] = useState<boolean>(false);
@@ -757,33 +774,122 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
         return () => window.clearInterval(timer);
     }, []);
 
-    const filteredSidebarSessions = useMemo(() => {
-        const q = sidebarSearch.trim().toLowerCase();
-        const sevRank: Record<string, number> = { red: 0, amber: 1, green: 2 };
-        const matched = sessions.filter(s => {
-            if (onlyErrSessions && !(Number(s.tool_error_count || 0) > 0)) return false;
-            if (!q) return true;
-            const hay = `${s.title} ${s.project} ${s.tool} ${s.first_human_preview}`.toLowerCase();
-            return hay.includes(q);
-        });
-        return [...matched].sort((a, b) => {
-            if (sidebarSortMode === 'priority') {
-                const sa = sevRank[a.severity] ?? 2;
-                const sb = sevRank[b.severity] ?? 2;
-                if (sa !== sb) return sa - sb;
-                if ((b.n_human_prompts || 0) !== (a.n_human_prompts || 0)) {
-                    return (b.n_human_prompts || 0) - (a.n_human_prompts || 0);
+    useEffect(() => {
+        const qTrim = sidebarSearch.trim();
+        if (qTrim.length < 2) {
+            setServerSearchItems([]);
+            setServerSearchTotal(0);
+            setServerSearchLoading(false);
+            return;
+        }
+        const ac = new AbortController();
+        setServerSearchLoading(true);
+        const timer = window.setTimeout(async () => {
+            try {
+                const params = new URLSearchParams({
+                    q: qTrim,
+                    period: searchScope === 'all' ? 'all' : period,
+                    tool: toolFilter,
+                    include_sub: includeSub ? '1' : '0',
+                    limit: '60',
+                });
+                if (searchScope === 'period' && period === 'date' && customDate) {
+                    params.set('date', customDate);
                 }
-                return getSessionActivityTs(b) - getSessionActivityTs(a);
+                const res = await fetch(`/api/owner/prompt-coach/search?${params.toString()}`, {
+                    headers: resolveAuthHeaders(),
+                    credentials: 'same-origin',
+                    signal: ac.signal,
+                });
+                const doc = await res.json().catch(() => null);
+                if (!ac.signal.aborted && res.ok && doc?.ok && Array.isArray(doc.items)) {
+                    setServerSearchItems(doc.items as AgPcSessionSummary[]);
+                    setServerSearchTotal(Number(doc.total_hits ?? doc.items.length));
+                }
+            } catch {
+                // Ignore abort / transient search failure
+            } finally {
+                if (!ac.signal.aborted) {
+                    setServerSearchLoading(false);
+                }
             }
-            // Default 'realtime': 1:1 with Antigravity PC Desktop (Running first -> last_modified_time DESC)
-            const runDiff = Number(Boolean(b.is_running)) - Number(Boolean(a.is_running));
-            if (runDiff !== 0) return runDiff;
-            const actDiff = getSessionActivityTs(b) - getSessionActivityTs(a);
-            if (actDiff !== 0) return actDiff;
-            return (b.n_human_prompts || 0) - (a.n_human_prompts || 0);
+        }, 220);
+        return () => {
+            ac.abort();
+            window.clearTimeout(timer);
+        };
+    }, [sidebarSearch, searchScope, period, customDate, toolFilter, includeSub, resolveAuthHeaders]);
+
+    const filteredSidebarSessions = useMemo(() => {
+        const qTokens = tokenizeVnSearch(sidebarSearch);
+        const sevRank: Record<string, number> = { red: 0, amber: 1, green: 2 };
+
+        if (qTokens.length === 0) {
+            const matched = sessions.filter(s => !(onlyErrSessions && !(Number(s.tool_error_count || 0) > 0)));
+            return [...matched].sort((a, b) => {
+                if (sidebarSortMode === 'priority') {
+                    const sa = sevRank[a.severity] ?? 2;
+                    const sb = sevRank[b.severity] ?? 2;
+                    if (sa !== sb) return sa - sb;
+                    if ((b.n_human_prompts || 0) !== (a.n_human_prompts || 0)) {
+                        return (b.n_human_prompts || 0) - (a.n_human_prompts || 0);
+                    }
+                    return getSessionActivityTs(b) - getSessionActivityTs(a);
+                }
+                const runDiff = Number(Boolean(b.is_running)) - Number(Boolean(a.is_running));
+                if (runDiff !== 0) return runDiff;
+                const actDiff = getSessionActivityTs(b) - getSessionActivityTs(a);
+                if (actDiff !== 0) return actDiff;
+                return (b.n_human_prompts || 0) - (a.n_human_prompts || 0);
+            });
+        }
+
+        const serverByKey = new Map<string, AgPcSessionSummary>();
+        serverSearchItems.forEach(it => serverByKey.set(it.session_key, it));
+
+        const merged = new Map<string, { item: AgPcSessionSummary; rank: number }>();
+        sessions.forEach(s => {
+            if (onlyErrSessions && !(Number(s.tool_error_count || 0) > 0)) return;
+            const srv = serverByKey.get(s.session_key);
+            const localScore = scoreVnSearchFields(
+                {
+                    title: s.title,
+                    project: `${s.project} ${s.tool}`,
+                    preview: s.first_human_preview,
+                    body: `${s.ai_summary || ''} ${s.ai_takeaway || ''}`,
+                },
+                qTokens
+            );
+            if (localScore > 0 || srv) {
+                const enriched: AgPcSessionSummary = srv
+                    ? {
+                          ...s,
+                          matched_in: srv.matched_in,
+                          matched_turn_idx: srv.matched_turn_idx,
+                          match_count: srv.match_count,
+                          matched_snippet: srv.matched_snippet,
+                          match_score: srv.match_score,
+                      }
+                    : s;
+                const rank = Math.max(localScore, Number(srv?.match_score || 0));
+                merged.set(s.session_key, { item: enriched, rank });
+            }
         });
-    }, [sessions, sidebarSearch, onlyErrSessions, sidebarSortMode]);
+
+        serverSearchItems.forEach(srv => {
+            if (onlyErrSessions && !(Number(srv.tool_error_count || 0) > 0)) return;
+            if (!merged.has(srv.session_key)) {
+                merged.set(srv.session_key, { item: srv, rank: Number(srv.match_score || 50) });
+            }
+        });
+
+        return Array.from(merged.values())
+            .sort((a, b) => {
+                if (b.rank !== a.rank) return b.rank - a.rank;
+                return getSessionActivityTs(b.item) - getSessionActivityTs(a.item);
+            })
+            .map(x => x.item);
+    }, [sessions, serverSearchItems, sidebarSearch, onlyErrSessions, sidebarSortMode]);
 
     const effectiveSessionKey = useMemo(() => {
         if (selectedSessionKey) {
@@ -807,8 +913,11 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
     latestKeyRef.current = effectiveSessionKey;
 
     const activeSummary = useMemo(
-        () => sessions.find(s => s.session_key === effectiveSessionKey) || null,
-        [sessions, effectiveSessionKey]
+        () =>
+            sessions.find(s => s.session_key === effectiveSessionKey) ||
+            serverSearchItems.find(s => s.session_key === effectiveSessionKey) ||
+            null,
+        [sessions, serverSearchItems, effectiveSessionKey]
     );
     const activeSummarySig = useMemo(() => buildSummaryCacheSig(activeSummary), [activeSummary]);
 
@@ -982,14 +1091,16 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
         setTurnFilter('all');
         setRenderLimit(INITIAL_TURN_BATCH);
         setHighlightedTurnIdx(null);
+        setInSessionCursor(0);
         problemCursorRef.current = -1;
         canvasScrollRef.current?.scrollTo({ top: 0, behavior: 'auto' });
     }, [effectiveSessionKey]);
 
     useEffect(() => {
         setRenderLimit(INITIAL_TURN_BATCH);
+        setInSessionCursor(0);
         problemCursorRef.current = -1;
-    }, [turnFilter]);
+    }, [turnFilter, inSessionQuery, inSessionOnlyMatches]);
 
     const isAnalyzingCurrent = Boolean(
         (effectiveSessionKey && analyzingKeys[effectiveSessionKey]) || activeSummary?.ai_analyzing
@@ -1259,7 +1370,7 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
         detail?.weak_prompt_count ??
         computedWeakTurnsCount;
 
-    const visiblePrompts = useMemo(() => {
+    const baseVisiblePrompts = useMemo(() => {
         if (turnFilter === 'weak') return activePrompts.filter(p => (p.score ?? 80) < WEAK_SCORE_THRESHOLD);
         if (turnFilter === 'err') return activePrompts.filter(p => p.had_tool_error || Boolean(p.assistant_err_snippet));
         if (turnFilter === 'redundant') {
@@ -1267,6 +1378,33 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
         }
         return activePrompts;
     }, [activePrompts, turnFilter]);
+
+    const inSessionTokens = useMemo(() => tokenizeVnSearch(inSessionQuery), [inSessionQuery]);
+
+    const inSessionMatchedTurnIdxs = useMemo(() => {
+        if (inSessionTokens.length === 0) return [];
+        return baseVisiblePrompts
+            .filter(p => {
+                const hay = [
+                    p.text_redacted || '',
+                    p.assistant_summary || '',
+                    p.assistant_err_snippet || '',
+                    p.verdict || '',
+                    p.lesson || '',
+                    p.improved_prompt || '',
+                    (p.files_touched || []).join(' '),
+                    (p.tools_triggered || []).join(' '),
+                ].join(' ');
+                return matchesAllVnTokens(hay, inSessionTokens);
+            })
+            .map(p => p.idx);
+    }, [baseVisiblePrompts, inSessionTokens]);
+
+    const visiblePrompts = useMemo(() => {
+        if (!inSessionOnlyMatches || inSessionTokens.length === 0) return baseVisiblePrompts;
+        const hitSet = new Set(inSessionMatchedTurnIdxs);
+        return baseVisiblePrompts.filter(p => hitSet.has(p.idx));
+    }, [baseVisiblePrompts, inSessionOnlyMatches, inSessionTokens.length, inSessionMatchedTurnIdxs]);
 
     const displayedPrompts = useMemo(
         () => visiblePrompts.slice(0, renderLimit),
@@ -1281,6 +1419,7 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                 const posInAll = activePrompts.findIndex(p => p.idx === targetIdx);
                 if (posInAll < 0) return;
                 setTurnFilter('all');
+                setInSessionOnlyMatches(false);
                 setRenderLimit(prev => Math.max(prev, posInAll + 8));
             } else if (posInVisible >= renderLimit) {
                 setRenderLimit(posInVisible + 8);
@@ -1296,6 +1435,23 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
         },
         [activePrompts, visiblePrompts, renderLimit]
     );
+
+    const stepInSessionMatch = useCallback(
+        (delta: 1 | -1) => {
+            if (inSessionMatchedTurnIdxs.length === 0) return;
+            const total = inSessionMatchedTurnIdxs.length;
+            const nextPos = ((inSessionCursor + delta) % total + total) % total;
+            setInSessionCursor(nextPos);
+            jumpToTurn(inSessionMatchedTurnIdxs[nextPos]);
+        },
+        [inSessionMatchedTurnIdxs, inSessionCursor, jumpToTurn]
+    );
+
+    useEffect(() => {
+        if (inSessionTokens.length > 0 && inSessionMatchedTurnIdxs.length > 0 && inSessionSearchOpen) {
+            setInSessionCursor(0);
+        }
+    }, [inSessionTokens, inSessionMatchedTurnIdxs.length, inSessionSearchOpen]);
 
     useEffect(() => {
         if (focusTurnIdx && detail && detail.prompts_sample?.some(p => p.idx === focusTurnIdx)) {
@@ -1340,26 +1496,48 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
         jumpToTurn(problemTurnIdxs[nextPos]);
     };
 
-    // Layered Escape handler: Close A/B -> Blur Input/Textarea -> Close Drawer -> Exit Fullscreen
+    // Layered Escape + Ctrl+F / `/` Search shortcuts: Close In-Session Search -> Close A/B -> Blur Input -> Close Drawer -> Exit Fullscreen
     useEffect(() => {
         if (typeof document === 'undefined' || !isFullscreen) return;
         const prevOverflow = document.body.style.overflow;
         document.body.style.overflow = 'hidden';
         const onKeyDown = (e: KeyboardEvent) => {
+            const activeEl = document.activeElement as HTMLElement | null;
+            const isTyping = Boolean(
+                activeEl &&
+                    (activeEl.tagName === 'TEXTAREA' ||
+                        activeEl.tagName === 'INPUT' ||
+                        activeEl.tagName === 'SELECT' ||
+                        activeEl.isContentEditable)
+            );
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+                e.preventDefault();
+                setInSessionSearchOpen(true);
+                window.setTimeout(() => inSessionSearchInputRef.current?.focus(), 40);
+                return;
+            }
+            if (!isTyping && e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                e.preventDefault();
+                setSidebarCollapsed(false);
+                window.setTimeout(() => sidebarSearchInputRef.current?.focus(), 40);
+                return;
+            }
             if (e.key !== 'Escape' || e.defaultPrevented) return;
+            if (inSessionSearchOpen) {
+                e.preventDefault();
+                if (activeEl === inSessionSearchInputRef.current && inSessionQuery) {
+                    setInSessionQuery('');
+                    return;
+                }
+                setInSessionSearchOpen(false);
+                return;
+            }
             if (composerAbResult) {
                 e.preventDefault();
                 setComposerAbResult(null);
                 return;
             }
-            const activeEl = document.activeElement as HTMLElement | null;
-            if (
-                activeEl &&
-                (activeEl.tagName === 'TEXTAREA' ||
-                    activeEl.tagName === 'INPUT' ||
-                    activeEl.tagName === 'SELECT' ||
-                    activeEl.isContentEditable)
-            ) {
+            if (isTyping && activeEl) {
                 e.preventDefault();
                 activeEl.blur();
                 return;
@@ -1377,7 +1555,7 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
             document.body.style.overflow = prevOverflow;
             window.removeEventListener('keydown', onKeyDown);
         };
-    }, [isFullscreen, composerAbResult, mobileDrawerOpen, onExitToOverview]);
+    }, [isFullscreen, inSessionSearchOpen, inSessionQuery, composerAbResult, mobileDrawerOpen, onExitToOverview]);
 
     // Authentic Antigravity PC Color Tokens
     const shellBg = agDark ? 'bg-[#191919] text-[#e8eaed] border-[#343434]' : 'bg-[#f9f9f8] text-[#1f1f1f] border-[#dfdfd8]';
@@ -1385,6 +1563,7 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
     const cardBg = agDark ? 'bg-[#212121] border-[#333333]' : 'bg-white border-[#dfdfd8]';
     const bubbleBg = agDark ? 'bg-[#2b2b2b] border-[#3a3a3a] text-[#e8eaed]' : 'bg-[#f3f3f1] border-[#dfdfd8] text-[#1f1f1f]';
     const mutedTxt = agDark ? 'text-[#a8adb5]' : 'text-[#5f6368]';
+    const pcMarkCls = agDark ? 'bg-amber-400/35 text-[#fff3cd] rounded px-0.5 font-semibold' : undefined;
 
     const avgPromptScore =
         detail?.prompt_eval_summary?.avg_prompt_score ??
@@ -1669,15 +1848,16 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                         </div>
                     </div>
 
-                    {/* Search Box */}
-                    <div className="px-3 pb-2">
+                    {/* Search Box + Scope Toggle */}
+                    <div className="px-3 pb-2 space-y-1.5">
                         <div className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg border ${cardBg}`}>
-                            <Search className={`w-3.5 h-3.5 shrink-0 ${mutedTxt}`} />
+                            <Search className={`w-3.5 h-3.5 shrink-0 ${serverSearchLoading ? 'text-indigo-500 animate-pulse' : mutedTxt}`} />
                             <input
+                                ref={sidebarSearchInputRef}
                                 type="text"
                                 value={sidebarSearch}
                                 onChange={e => setSidebarSearch(e.target.value)}
-                                placeholder="Tìm phiên, dự án, nội dung..."
+                                placeholder="Tìm không dấu toàn kho (nhấn /)..."
                                 className="w-full bg-transparent text-xs outline-none"
                             />
                             {sidebarSearch && (
@@ -1691,6 +1871,26 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                                 </button>
                             )}
                         </div>
+                        {sidebarSearch.trim().length > 0 && (
+                            <div className="flex items-center justify-between gap-1.5 text-xs tabular-nums px-0.5">
+                                <span className={mutedTxt}>
+                                    {serverSearchLoading
+                                        ? 'Đang quét FTS5 toàn kho...'
+                                        : `${filteredSidebarSessions.length} khớp${serverSearchTotal > filteredSidebarSessions.length ? ` / ${serverSearchTotal} toàn DB` : ''}`}
+                                </span>
+                                <button
+                                    type="button"
+                                    onClick={() => setSearchScope(s => (s === 'all' ? 'period' : 'all'))}
+                                    className={`px-2 py-0.5 rounded-md border text-xs font-bold cursor-pointer ${
+                                        searchScope === 'all'
+                                            ? 'bg-indigo-500/15 text-indigo-600 dark:text-indigo-300 border-indigo-500/40'
+                                            : cardBg
+                                    }`}
+                                >
+                                    {searchScope === 'all' ? 'Toàn lịch sử' : 'Chỉ kỳ đang xem'}
+                                </button>
+                            </div>
+                        )}
                     </div>
 
                     {/* Quick Actions */}
@@ -1781,150 +1981,157 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                             </button>
                         </div>
 
-                        {pinnedSidebarSessions.length > 0 && (
-                            <div className="space-y-1">
-                                <div className={`px-1.5 py-1 flex items-center gap-1.5 text-xs font-bold ${mutedTxt}`}>
-                                    <Pin className="w-3.5 h-3.5 shrink-0 text-amber-500" />
-                                    <span>Đã ghim</span>
-                                </div>
-                                {pinnedSidebarSessions.map(s => {
-                                    const isActive = s.session_key === effectiveSessionKey;
-                                    const sScore = Math.round(s.avg_prompt_score ?? s.rule_score ?? 100);
-                                    const tm = TOOL_STYLE[s.tool] || {
-                                        label: s.tool,
-                                        shortLabel: s.tool,
-                                        dotCls: 'bg-slate-500',
-                                    };
-                                    return (
-                                        <button
-                                            key={`pin-${s.session_key}`}
-                                            type="button"
-                                            onClick={() => {
-                                                setShowRealtimeReport(false);
-                                                onSelectSessionKey(s.session_key);
-                                                setMobileDrawerOpen(false);
-                                            }}
-                                            className={`w-full text-left px-2.5 py-2 rounded-xl border transition-colors cursor-pointer space-y-1 ${
-                                                isActive
-                                                    ? agDark
-                                                        ? 'bg-[#2a2a2a] border-[#454545]'
-                                                        : 'bg-[#e3e3e0] border-[#cfcfc8]'
-                                                    : 'border-transparent hover:bg-black/[0.04] dark:hover:bg-white/[0.04]'
-                                            }`}
-                                        >
-                                            <div className="flex items-start justify-between gap-1.5">
-                                                <span className="text-xs font-semibold leading-snug line-clamp-2 break-words">
-                                                    {cleanTitle(s.title, s.first_human_preview, s.session_key)}
-                                                </span>
-                                                <span
-                                                    className={`px-2 py-0.5 rounded-full border text-xs font-extrabold shrink-0 tabular-nums ${scorePillClasses(
-                                                        sScore,
-                                                        agDark
-                                                    )}`}
-                                                >
-                                                    {sScore}đ
-                                                </span>
-                                            </div>
-                                            <div className={`flex items-center justify-between gap-1.5 text-xs ${mutedTxt} tabular-nums`}>
-                                                <span className="inline-flex items-center gap-1.5 font-semibold truncate">
-                                                    <span className={`w-2 h-2 rounded-full shrink-0 ${tm.dotCls}`} />
-                                                    <span>
-                                                        {tm.label} · {s.n_human_prompts}p
-                                                    </span>
-                                                    {(s.tool_error_count || 0) > 0 && (
-                                                        <span className="text-rose-600 dark:text-rose-400 font-extrabold">
-                                                            · {s.tool_error_count} lỗi
-                                                        </span>
-                                                    )}
-                                                </span>
-                                                {s.is_running ? (
-                                                    <AntigravityRunningGridIcon />
-                                                ) : (
-                                                    <span className="shrink-0">
-                                                        {formatRelTime(getSessionActivityTs(s), nowEpochSec)}
+                        {(() => {
+                            const hasSearchQ = sidebarSearch.trim().length > 0;
+                            const renderSessionCard = (s: AgPcSessionSummary, keyPrefix: string) => {
+                                const isActive = s.session_key === effectiveSessionKey;
+                                const sScore = Math.round(s.avg_prompt_score ?? s.rule_score ?? 100);
+                                const tm = TOOL_STYLE[s.tool] || {
+                                    label: s.tool,
+                                    shortLabel: s.tool,
+                                    dotCls: 'bg-slate-500',
+                                };
+                                const matchLabel =
+                                    s.matched_turn_idx && s.matched_turn_idx > 0
+                                        ? `Khớp lượt #${s.matched_turn_idx}`
+                                        : s.matched_in === 'ai'
+                                          ? 'AI chẩn đoán'
+                                          : s.matched_in === 'file'
+                                            ? 'Tệp mã'
+                                            : '';
+                                return (
+                                    <button
+                                        key={`${keyPrefix}${s.session_key}`}
+                                        type="button"
+                                        onClick={() => {
+                                            setShowRealtimeReport(false);
+                                            onSelectSessionKey(s.session_key);
+                                            if (hasSearchQ && s.matched_turn_idx && s.matched_turn_idx > 0) {
+                                                setPendingScrollIdx(s.matched_turn_idx);
+                                            }
+                                            setMobileDrawerOpen(false);
+                                        }}
+                                        className={`w-full text-left px-2.5 py-2 rounded-xl border transition-colors cursor-pointer space-y-1 ${
+                                            isActive
+                                                ? agDark
+                                                    ? 'bg-[#2a2a2a] border-[#454545]'
+                                                    : 'bg-[#e3e3e0] border-[#cfcfc8]'
+                                                : 'border-transparent hover:bg-black/[0.04] dark:hover:bg-white/[0.04]'
+                                        }`}
+                                    >
+                                        <div className="flex items-start justify-between gap-1.5">
+                                            <span className="text-xs font-semibold leading-snug line-clamp-2 break-words">
+                                                <HighlightText
+                                                    text={cleanTitle(s.title, s.first_human_preview, s.session_key)}
+                                                    query={sidebarSearch}
+                                                    markClassName={pcMarkCls}
+                                                />
+                                            </span>
+                                            <span
+                                                className={`px-2 py-0.5 rounded-full border text-xs font-extrabold shrink-0 tabular-nums ${scorePillClasses(
+                                                    sScore,
+                                                    agDark
+                                                )}`}
+                                            >
+                                                {sScore}đ
+                                            </span>
+                                        </div>
+                                        {hasSearchQ && s.matched_snippet && (
+                                            <div className={`text-xs leading-snug line-clamp-2 break-words ${mutedTxt}`}>
+                                                {matchLabel && (
+                                                    <span className="mr-1 px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-600 dark:text-indigo-300 font-bold">
+                                                        {matchLabel}
                                                     </span>
                                                 )}
+                                                <HighlightText text={s.matched_snippet} query={sidebarSearch} markClassName={pcMarkCls} />
                                             </div>
-                                        </button>
-                                    );
-                                })}
-                            </div>
-                        )}
+                                        )}
+                                        <div className={`flex items-center justify-between gap-1.5 text-xs ${mutedTxt} tabular-nums`}>
+                                            <span className="inline-flex items-center gap-1.5 font-semibold truncate">
+                                                <span className={`w-2 h-2 rounded-full shrink-0 ${tm.dotCls}`} />
+                                                <span>
+                                                    {tm.label} · {s.n_human_prompts}p
+                                                </span>
+                                                {(s.tool_error_count || 0) > 0 && (
+                                                    <span className="text-rose-600 dark:text-rose-400 font-extrabold">
+                                                        · {s.tool_error_count} lỗi
+                                                    </span>
+                                                )}
+                                            </span>
+                                            {s.is_running ? (
+                                                <AntigravityRunningGridIcon />
+                                            ) : (
+                                                <span className="shrink-0">
+                                                    {formatRelTime(getSessionActivityTs(s), nowEpochSec)}
+                                                </span>
+                                            )}
+                                        </div>
+                                    </button>
+                                );
+                            };
 
-                        {groupedByProject.length === 0 && pinnedSidebarSessions.length === 0 ? (
-                            <div className={`py-8 text-center text-xs ${mutedTxt}`}>
-                                Không có phiên nào khớp bộ lọc hiện tại.
-                            </div>
-                        ) : (
-                            groupedByProject.map(([projName, list]) => (
-                                <div key={projName} className="space-y-1">
-                                    <div className={`px-1.5 py-1 flex items-center gap-1.5 text-xs font-bold ${mutedTxt}`}>
-                                        <Folder className="w-3.5 h-3.5 shrink-0" />
-                                        <span className="truncate">{projName}</span>
-                                    </div>
-                                    {list.map(s => {
-                                        const isActive = s.session_key === effectiveSessionKey;
-                                        const sScore = Math.round(s.avg_prompt_score ?? s.rule_score ?? 100);
-                                        const tm = TOOL_STYLE[s.tool] || {
-                                            label: s.tool,
-                                            shortLabel: s.tool,
-                                            dotCls: 'bg-slate-500',
-                                        };
-                                        return (
-                                            <button
-                                                key={s.session_key}
-                                                type="button"
-                                                onClick={() => {
-                                                    onSelectSessionKey(s.session_key);
-                                                    setMobileDrawerOpen(false);
-                                                }}
-                                                className={`w-full text-left px-2.5 py-2 rounded-xl border transition-colors cursor-pointer space-y-1 ${
-                                                    isActive
-                                                        ? agDark
-                                                            ? 'bg-[#2a2a2a] border-[#454545]'
-                                                            : 'bg-[#e3e3e0] border-[#cfcfc8]'
-                                                        : 'border-transparent hover:bg-black/[0.04] dark:hover:bg-white/[0.04]'
-                                                }`}
-                                            >
-                                                <div className="flex items-start justify-between gap-1.5">
-                                                    <span className="text-xs font-semibold leading-snug line-clamp-2 break-words">
-                                                        {cleanTitle(s.title, s.first_human_preview, s.session_key)}
-                                                    </span>
-                                                    <span
-                                                        className={`px-2 py-0.5 rounded-full border text-xs font-extrabold shrink-0 tabular-nums ${scorePillClasses(
-                                                            sScore,
-                                                            agDark
-                                                        )}`}
+                            return (
+                                <>
+                                    {pinnedSidebarSessions.length > 0 && (
+                                        <div className="space-y-1">
+                                            <div className={`px-1.5 py-1 flex items-center gap-1.5 text-xs font-bold ${mutedTxt}`}>
+                                                <Pin className="w-3.5 h-3.5 shrink-0 text-amber-500" />
+                                                <span>Đã ghim</span>
+                                            </div>
+                                            {pinnedSidebarSessions.map(s => renderSessionCard(s, 'pin-'))}
+                                        </div>
+                                    )}
+
+                                    {groupedByProject.length === 0 && pinnedSidebarSessions.length === 0 ? (
+                                        <div className={`py-8 px-2 text-center text-xs space-y-2.5 ${mutedTxt}`}>
+                                            <div>Không tìm thấy phiên nào khớp bộ lọc hiện tại.</div>
+                                            <div className="flex flex-wrap items-center justify-center gap-1.5">
+                                                {sidebarSearch && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setSidebarSearch('')}
+                                                        className={`px-2.5 py-1 rounded-lg border font-bold cursor-pointer ${cardBg}`}
                                                     >
-                                                        {sScore}đ
+                                                        Xóa từ khóa
+                                                    </button>
+                                                )}
+                                                {searchScope !== 'all' && sidebarSearch && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setSearchScope('all')}
+                                                        className="px-2.5 py-1 rounded-lg bg-indigo-600 text-white font-bold cursor-pointer"
+                                                    >
+                                                        Tìm toàn lịch sử
+                                                    </button>
+                                                )}
+                                                {onlyErrSessions && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setOnlyErrSessions(false)}
+                                                        className={`px-2.5 py-1 rounded-lg border font-bold cursor-pointer ${cardBg}`}
+                                                    >
+                                                        Bỏ lọc lỗi Tool
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        groupedByProject.map(([projName, list]) => (
+                                            <div key={projName} className="space-y-1">
+                                                <div className={`px-1.5 py-1 flex items-center justify-between gap-1.5 text-xs font-bold ${mutedTxt}`}>
+                                                    <span className="inline-flex items-center gap-1.5 min-w-0">
+                                                        <Folder className="w-3.5 h-3.5 shrink-0" />
+                                                        <span className="truncate">{projName}</span>
                                                     </span>
+                                                    <span className="tabular-nums shrink-0">{list.length}</span>
                                                 </div>
-                                                <div className={`flex items-center justify-between gap-1.5 text-xs ${mutedTxt} tabular-nums`}>
-                                                    <span className="inline-flex items-center gap-1.5 font-semibold truncate">
-                                                        <span className={`w-2 h-2 rounded-full shrink-0 ${tm.dotCls}`} />
-                                                        <span>
-                                                            {tm.label} · {s.n_human_prompts}p
-                                                        </span>
-                                                        {(s.tool_error_count || 0) > 0 && (
-                                                            <span className="text-rose-600 dark:text-rose-400 font-extrabold">
-                                                                · {s.tool_error_count} lỗi
-                                                            </span>
-                                                        )}
-                                                    </span>
-                                                    {s.is_running ? (
-                                                        <AntigravityRunningGridIcon />
-                                                    ) : (
-                                                        <span className="shrink-0">
-                                                            {formatRelTime(getSessionActivityTs(s), nowEpochSec)}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                            </button>
-                                        );
-                                    })}
-                                </div>
-                            ))
-                        )}
+                                                {list.map(s => renderSessionCard(s, ''))}
+                                            </div>
+                                        ))
+                                    )}
+                                </>
+                            );
+                        })()}
                     </div>
 
                     {/* Sidebar Footer Host Box */}
@@ -2181,6 +2388,25 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                                         </div>
 
                                         <div className="flex flex-wrap items-center gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setInSessionSearchOpen(v => !v);
+                                                    window.setTimeout(() => inSessionSearchInputRef.current?.focus(), 40);
+                                                }}
+                                                title="Tìm nội dung ngay trong phiên này (Ctrl+F)"
+                                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border font-bold cursor-pointer transition-colors ${
+                                                    inSessionSearchOpen || inSessionQuery.trim()
+                                                        ? 'bg-indigo-600 text-white border-indigo-600'
+                                                        : `${cardBg} hover:border-indigo-400`
+                                                }`}
+                                            >
+                                                <Search className="w-3.5 h-3.5" />
+                                                <span>
+                                                    Tìm trong phiên
+                                                    {inSessionTokens.length > 0 ? ` (${inSessionMatchedTurnIdxs.length})` : ''}
+                                                </span>
+                                            </button>
                                             {problemTurnIdxs.length > 0 && (
                                                 <button
                                                     type="button"
@@ -2200,6 +2426,92 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                                             </span>
                                         </div>
                                     </div>
+
+                                    {(inSessionSearchOpen || inSessionQuery.trim().length > 0) && (
+                                        <div className={`flex flex-wrap items-center gap-2 p-2 rounded-xl border text-xs tabular-nums ${cardBg}`}>
+                                            <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
+                                                <Search className={`w-3.5 h-3.5 shrink-0 ${mutedTxt}`} />
+                                                <input
+                                                    ref={inSessionSearchInputRef}
+                                                    type="text"
+                                                    value={inSessionQuery}
+                                                    onChange={e => setInSessionQuery(e.target.value)}
+                                                    onKeyDown={e => {
+                                                        if (e.key === 'Enter') {
+                                                            e.preventDefault();
+                                                            stepInSessionMatch(e.shiftKey ? -1 : 1);
+                                                        } else if (e.key === 'Escape') {
+                                                            e.stopPropagation();
+                                                            if (inSessionQuery) setInSessionQuery('');
+                                                            else setInSessionSearchOpen(false);
+                                                        }
+                                                    }}
+                                                    placeholder="Tìm trong câu prompt, kết luận AI, file chạm tới (Ctrl+F)..."
+                                                    className="w-full bg-transparent text-xs outline-none"
+                                                />
+                                                {inSessionQuery && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setInSessionQuery('')}
+                                                        aria-label="Xóa tìm trong phiên"
+                                                        className="cursor-pointer"
+                                                    >
+                                                        <X className="w-3.5 h-3.5" />
+                                                    </button>
+                                                )}
+                                            </div>
+                                            {inSessionTokens.length > 0 && (
+                                                <div className="flex items-center gap-1">
+                                                    <span className={`font-bold px-1.5 ${mutedTxt}`}>
+                                                        {inSessionMatchedTurnIdxs.length > 0
+                                                            ? `${(inSessionCursor % inSessionMatchedTurnIdxs.length) + 1}/${inSessionMatchedTurnIdxs.length} lượt`
+                                                            : '0 lượt khớp'}
+                                                    </span>
+                                                    <button
+                                                        type="button"
+                                                        disabled={inSessionMatchedTurnIdxs.length === 0}
+                                                        onClick={() => stepInSessionMatch(-1)}
+                                                        aria-label="Lượt khớp trước"
+                                                        className={`p-1 rounded-md border cursor-pointer disabled:opacity-40 ${cardBg}`}
+                                                    >
+                                                        <ChevronUp className="w-3.5 h-3.5" />
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        disabled={inSessionMatchedTurnIdxs.length === 0}
+                                                        onClick={() => stepInSessionMatch(1)}
+                                                        aria-label="Lượt khớp tiếp"
+                                                        className={`p-1 rounded-md border cursor-pointer disabled:opacity-40 ${cardBg}`}
+                                                    >
+                                                        <ChevronDown className="w-3.5 h-3.5" />
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setInSessionOnlyMatches(v => !v)}
+                                                        className={`px-2 py-1 rounded-md border font-bold cursor-pointer ${
+                                                            inSessionOnlyMatches
+                                                                ? 'bg-indigo-600 text-white border-indigo-600'
+                                                                : cardBg
+                                                        }`}
+                                                    >
+                                                        Chỉ hiện khớp
+                                                    </button>
+                                                </div>
+                                            )}
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    setInSessionQuery('');
+                                                    setInSessionOnlyMatches(false);
+                                                    setInSessionSearchOpen(false);
+                                                }}
+                                                aria-label="Đóng thanh tìm trong phiên"
+                                                className={`p-1 rounded-md ${mutedTxt} hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer`}
+                                            >
+                                                <X className="w-3.5 h-3.5" />
+                                            </button>
+                                        </div>
+                                    )}
 
                                     <div className="hidden lg:grid lg:grid-cols-2 gap-3.5 text-xs font-extrabold">
                                         <div className={`px-3 py-1.5 rounded-xl border flex items-center justify-between ${bubbleBg}`}>
@@ -2317,7 +2629,7 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                                                                     isLongPrompt && !promptExpanded ? 'line-clamp-6' : ''
                                                                 }`}
                                                             >
-                                                                {rawPromptTxt}
+                                                                <HighlightText text={rawPromptTxt} query={inSessionQuery} markClassName={pcMarkCls} />
                                                             </div>
                                                             {isLongPrompt && (
                                                                 <button
@@ -2423,7 +2735,7 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                                                                     }`}
                                                                 >
                                                                     <span className={`font-bold ${mutedTxt}`}>Kết luận AI: </span>
-                                                                    {summaryTxt}
+                                                                    <HighlightText text={summaryTxt} query={inSessionQuery} markClassName={pcMarkCls} />
                                                                 </div>
                                                             )}
 
@@ -2451,7 +2763,7 @@ export const AntigravityPcCoachTab: React.FC<AntigravityPcCoachTabProps> = ({
                                                                     >
                                                                         <FileCode className="w-3 h-3 text-sky-500 shrink-0" />
                                                                         <span className="truncate max-w-[220px]" title={fp}>
-                                                                            {fp}
+                                                                            <HighlightText text={fp} query={inSessionQuery} markClassName={pcMarkCls} />
                                                                         </span>
                                                                     </span>
                                                                 ))}

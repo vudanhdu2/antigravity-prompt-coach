@@ -35,7 +35,7 @@ if str(ROOT_DIR) not in sys.path:
 import coach_collector  # noqa: E402
 import coach_engine  # noqa: E402
 
-VERSION = '1.0.0'
+VERSION = '1.2.0'
 DEFAULT_PORT = int(os.environ.get('PROMPT_COACH_PORT', '8788'))
 
 mimetypes.add_type('application/javascript', '.js')

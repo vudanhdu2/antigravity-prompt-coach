@@ -1,10 +1,16 @@
-# Antigravity Prompt Coach v1.0 — Chấm Điểm 6×7 Rubric, Đối Chiếu Song Song Thật ↔ 1-Phát & Đồng Bộ Realtime PC (Self-Host · 100% Zero-Data-Leak)
+# Antigravity Prompt Coach v1.2 — Chấm Điểm 6×7 Rubric, Tìm Kiếm FTS5 Tiếng Việt, Báo Cáo 30s & Đồng Bộ Realtime PC (Self-Host · 100% Zero-Data-Leak)
 
-> **Bộ công cụ tự host (Self-Host) trên máy tính cá nhân giúp bạn tự động chấm điểm, bắt bệnh và tối ưu toàn bộ lịch sử Prompt của cả 3 công cụ AI: Antigravity Desktop, Claude Code và Codex Desktop (ChatGPT PC) — 0 cần cài Node.js hay thư viện ngoài (chỉ cần Python 3.9+ chuẩn), đồng bộ thứ tự Realtime 2.5 giây khớp 1:1 với cửa sổ Antigravity PC và giữ 100% dữ liệu trên ổ cứng máy bạn.**
+> **Bộ công cụ tự host (Self-Host) trên máy tính cá nhân giúp bạn tự động chấm điểm, tìm kiếm siêu tốc FTS5 tiếng Việt có/không dấu, bắt bệnh và tối ưu toàn bộ lịch sử Prompt của cả 3 công cụ AI: Antigravity Desktop, Claude Code và Codex Desktop (ChatGPT PC) — 0 cần cài Node.js hay thư viện ngoài (chỉ cần Python 3.9+ chuẩn), đồng bộ thứ tự Realtime 2.5 giây khớp 1:1 với cửa sổ Antigravity PC và giữ 100% dữ liệu trên ổ cứng máy bạn.**
 
 ---
 
-## Điểm nổi bật
+## Điểm nổi bật (Cập nhật v1.2.0 — 27/11/2026 · xem [CHANGELOG.md](CHANGELOG.md))
+
+- **✨ Mới trên v1.2.0**:
+  - **Tìm kiếm Tiếng Việt FTS5 & Nhảy thẳng tới đúng lượt trong phiên**: Tìm cực nhanh theo từ khóa tiếng Việt có dấu / không dấu trên toàn bộ lịch sử prompt & phiên hội thoại, bấm 1 chạm nhảy thẳng tới đúng lượt câu lệnh cần đối chiếu.
+  - **Loại bỏ prompt cha bị fork & khử trùng lặp `step_index` bị sửa**: Khi bạn nhân bản (fork) phiên hội thoại hoặc sửa/rewind prompt trong Antigravity Desktop, bộ thu thập tự động loại trừ các prompt lịch sử kế thừa từ phiên cha và chỉ giữ bản sửa cuối của từng `step_index`, chấm điểm chính xác 100%.
+  - **Tối ưu tốc độ quét & chuẩn hóa Telemetry**: Bộ nhớ đệm `file_cache` trong RAM loại bỏ việc đọc lặp các blob SQLite lớn, giảm I/O ổ cứng xuống tối thiểu khi watcher chạy 2.5s liên tục.
+  - **Đồng bộ Báo cáo Nhịp Realtime 30 Giây & Pareto 80/20** (từ v1.1.0) cùng bộ web build sẵn (`web/`) mới nhất.
 
 1. **Giao diện Antigravity PC Song song (Thật ↔ 1-Phát) Full Màn Hình (`100vw × 100dvh`)**:
    - **Cột trái**: Mô phỏng nguyên bản cửa sổ hội thoại thật của bạn trên Antigravity PC (kèm thời lượng chạy từng lượt `turn_duration_s`, tóm tắt phản hồi của AI `assistant_summary`, các file đã sửa/đọc `files_touched`, và chỉ báo đỏ chính xác công cụ bị lỗi `failed_tools`).
